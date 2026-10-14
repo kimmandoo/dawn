@@ -208,6 +208,11 @@ class JobRow(QFrame):
         self.status_lbl.setText(text)
         color = STATUS_COLOR.get(status)
         self.status_lbl.setStyleSheet(f"color: {color};" if color else "")
+        if status in ("extract", "postprocess"):
+            self.bar.setRange(0, 0)  # indeterminate while preparing/converting
+        elif status == "wait":
+            self.bar.setRange(0, 100)
+            self.bar.setValue(0)
         if status in ("done", "error", "cancelled"):
             self.cancel_btn.hide()
             self.retry_btn.setVisible(status == "error")
@@ -386,6 +391,14 @@ class MainWindow(QMainWindow):
         self.list.itemDoubleClicked.connect(self._open_row_folder)
         lay.addWidget(self.list, 1)
 
+        self.empty_hint = QLabel(
+            "여기로 링크를 드래그하거나\n위 칸에 붙여넣으세요", self.list
+        )
+        self.empty_hint.setObjectName("appSub")
+        self.empty_hint.setAlignment(Qt.AlignCenter)
+        self.empty_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.empty_hint.resize(self.list.width(), 60)
+
         hint = QLabel("목록 항목 더블클릭 → 저장 폴더 열기")
         hint.setObjectName("appSub")
         hint.setAlignment(Qt.AlignCenter)
@@ -472,8 +485,11 @@ class MainWindow(QMainWindow):
         self.url_edit.setText(QApplication.clipboard().text().strip())
 
     def _on_url_changed(self, text: str) -> None:
-        # 링크가 들어오면(붙여넣기) 잠깐 후 자동 시작
-        if URL_RE.search(text or ""):
+        # 붙여넣기/드롭 = 큰 덩어리 입력일 때만 자동 시작; 타이핑은 건드리지 않음
+        prev = getattr(self, "_prev_url_len", 0)
+        self._prev_url_len = len(text or "")
+        grew_by_paste = len(text or "") - prev >= 10
+        if grew_by_paste and URL_RE.search(text or ""):
             self._auto_timer.start()
         else:
             self._auto_timer.stop()
@@ -511,7 +527,12 @@ class MainWindow(QMainWindow):
         if self._url_active(url):
             return
         outdir = self.folder_edit.text().strip()
-        os.makedirs(outdir, exist_ok=True)
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except OSError:
+            outdir = os.path.expanduser("~/Downloads/Dawn")
+            self.folder_edit.setText(outdir)
+            os.makedirs(outdir, exist_ok=True)
         job = DownloadJob(
             url=url,
             mode=self._mode,
@@ -574,6 +595,10 @@ class MainWindow(QMainWindow):
             if n_fail:
                 bits.append(f"실패 {n_fail}")
             self.summary_lbl.setText(" · ".join(bits))
+        self.empty_hint.setVisible(not self._rows)
+        if not self._rows:
+            self.empty_hint.resize(self.list.width(), 60)
+            self.empty_hint.move(0, int(self.list.height() * 0.3))
 
     def _add_row(self, job: DownloadJob) -> None:
         job_id = self._next_id
