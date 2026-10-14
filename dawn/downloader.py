@@ -163,7 +163,7 @@ def _ydl_opts(job: DownloadJob) -> dict:
         "outtmpl": os.path.join(
             job.outdir,
             "%(playlist_title|)s",
-            "%(playlist_index&{:>03} - |)s%(title).150B [%(id)s].%(ext)s",
+            "%(playlist_index&{:>03} - |)s%(title).150B.%(ext)s",
         ),
         "ffmpeg_location": _FFMPEG_EXE,
         "noplaylist": not job.playlist,
