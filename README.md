@@ -12,7 +12,6 @@
 |---|---|
 | Windows x64 | `Dawn-windows-x64.zip` → 압축 해제 후 `Dawn.exe` 실행 |
 | macOS Apple Silicon (M1~M4) | `Dawn-macos-arm64.zip` → `Dawn.app` |
-| macOS Intel | `Dawn-macos-x86_64.zip` → `Dawn.app` |
 
 > macOS 첫 실행: 앱 우클릭 → **열기** (미서명 앱 Gatekeeper 통과). ffmpeg·deno 내장.
 
