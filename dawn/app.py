@@ -182,8 +182,10 @@ class JobRow(QFrame):
         self.url = url
         self.outdir = ""
 
-        icon = QLabel("🎬" if mode == "video" else "🎵")
-        icon.setFixedWidth(24)
+        self.icon = QLabel("🎬" if mode == "video" else "🎵")
+        self.icon.setFixedWidth(40)
+        self.icon.setFixedHeight(28)
+        self.icon.setAlignment(Qt.AlignCenter)
         self.title = QLabel(url)
         self.title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.cancel_btn = QPushButton("✕")
@@ -202,7 +204,7 @@ class JobRow(QFrame):
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
-        top.addWidget(icon)
+        top.addWidget(self.icon)
         top.addWidget(self.title, 1)
         top.addWidget(self.retry_btn)
         top.addWidget(self.folder_btn)
@@ -294,6 +296,14 @@ class MainWindow(QMainWindow):
         self._next_id = 1
         self._rows = {}  # id -> (QListWidgetItem, JobRow)
         self._mode = "video"
+        self._last_clip = ""
+        self._thumb_pool = []
+        from PySide6.QtWidgets import QSystemTrayIcon
+
+        self._tray = QSystemTrayIcon(self)
+        self._tray.setIcon(QIcon(_res("icon.png")))
+        if self._tray.isSystemTrayAvailable():
+            self._tray.show()
         self._auto_timer = QTimer(self)
         self._auto_timer.setSingleShot(True)
         self._auto_timer.setInterval(700)
@@ -304,7 +314,16 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
         self._build_ui()
-        self._load_settings()
+
+        # clipboard watcher (opt-in via adv checkbox)
+        self._clip_timer = QTimer(self)
+        self._clip_timer.setInterval(1200)
+        self._clip_timer.timeout.connect(self._clipboard_tick)
+        self.clip_chk.toggled.connect(
+            lambda on: self._clip_timer.start() if on else self._clip_timer.stop()
+        )
+        if self.clip_chk.isChecked():
+            self._clip_timer.start()
 
     # ----- UI -----
 
@@ -441,6 +460,27 @@ class MainWindow(QMainWindow):
         adv_lay.addWidget(self.geo_chk)
         self.adv.hide()
 
+
+        sec_lbl = QLabel("일부만 받기 (선택) — 시:분:초 또는 분:초")
+        sec_lbl.setObjectName("hint")
+        adv_lay.addWidget(sec_lbl)
+        sec_row = QHBoxLayout()
+        self.sec_start = QLineEdit()
+        self.sec_start.setPlaceholderText("시작  예) 0:30")
+        self.sec_end = QLineEdit()
+        self.sec_end.setPlaceholderText("끝  예) 2:15")
+        sec_row.addWidget(self.sec_start)
+        sec_row.addWidget(QLabel("~"))
+        sec_row.addWidget(self.sec_end)
+        adv_lay.addLayout(sec_row)
+
+        self.subs_chk = QCheckBox("자막도 저장 (한국어/영어 .srt)")
+        adv_lay.addWidget(self.subs_chk)
+        self.dedup_chk = QCheckBox("이미 받은 항목 건너뛰기 (다운로드 이력 기억)")
+        self.dedup_chk.setChecked(True)
+        adv_lay.addWidget(self.dedup_chk)
+        self.clip_chk = QCheckBox("클립보드 감시 — 링크 복사하면 바로 다운로드")
+        adv_lay.addWidget(self.clip_chk)
         self.autoproxy_chk = QCheckBox(
             "로컬 우회툴 자동 연결 (GoodbyeDPI·Psiphon·Clash 등 켜져 있으면 자동 감지)"
         )
@@ -564,6 +604,11 @@ class MainWindow(QMainWindow):
         self.settings.setValue("proxy", self.proxy_edit.text())
         self.settings.setValue("geo_bypass", self.geo_chk.isChecked())
         self.settings.setValue("autoproxy", self.autoproxy_chk.isChecked())
+        self.settings.setValue("sec_start", self.sec_start.text())
+        self.settings.setValue("sec_end", self.sec_end.text())
+        self.settings.setValue("subtitles", self.subs_chk.isChecked())
+        self.settings.setValue("dedup", self.dedup_chk.isChecked())
+        self.settings.setValue("clip_watch", self.clip_chk.isChecked())
 
     # ----- actions -----
 
@@ -654,8 +699,59 @@ class MainWindow(QMainWindow):
             playlist=self._resolve_playlist(url, playlist_cache),
             proxy=self._effective_proxy(),
             geo_bypass=self.geo_chk.isChecked(),
+            section=self._parse_section(),
+            subtitles=self.subs_chk.isChecked(),
+            dedup=self.dedup_chk.isChecked(),
         )
         self._add_row(job)
+
+    # ----- helpers for new features -----
+
+    def _parse_section(self) -> "tuple | None":
+        """Parse 'H:MM:SS'/'MM:SS'/'SS' fields into (start, end) seconds."""
+        def to_sec(s: str):
+            s = s.strip()
+            if not s:
+                return None
+            parts = s.split(":")
+            try:
+                nums = [float(p) for p in parts]
+            except ValueError:
+                return None
+            if len(nums) == 1:
+                return nums[0]
+            if len(nums) == 2:
+                return nums[0] * 60 + nums[1]
+            if len(nums) == 3:
+                return nums[0] * 3600 + nums[1] * 60 + nums[2]
+            return None
+
+        start = to_sec(self.sec_start.text())
+        end = to_sec(self.sec_end.text())
+        if start is None and end is None:
+            return None
+        return (start or 0, end if end is not None else float("inf"))
+
+    def _clipboard_tick(self) -> None:
+        if not self.clip_chk.isChecked():
+            return
+        text = QApplication.clipboard().text().strip()
+        if text == self._last_clip or not text:
+            return
+        self._last_clip = text
+        if URL_RE.fullmatch(text):
+            self._enqueue_url(text)
+
+    def _notify_done(self, title: str) -> None:
+        """OS toast when a job finishes; falls back to taskbar flash."""
+        from PySide6.QtWidgets import QSystemTrayIcon
+
+        if self._tray.isSystemTrayAvailable():
+            self._tray.showMessage(
+                "Dawn — 다운로드 완료", title, QSystemTrayIcon.Information, 4000
+            )
+        else:
+            QApplication.alert(self, 0)
         self._update_summary()
 
     def _effective_proxy(self) -> "str | None":
@@ -792,10 +888,14 @@ class MainWindow(QMainWindow):
                 row.set_progress(d.get("fraction"), d.get("speed"), d.get("eta"))
         elif ev == "title":
             row.title.setText(d.get("title") or row.title.text())
+            thumb = d.get("thumb")
+            if thumb:
+                self._load_thumb(row, thumb)
         elif ev == "pp":
             row.set_state("postprocess")
         elif ev == "done":
             row.set_state("done")
+            self._notify_done(row.title.text())
             self._update_summary()
         elif ev == "cancelled":
             row.set_state("cancelled")
@@ -804,6 +904,39 @@ class MainWindow(QMainWindow):
             row.set_state("error", (d.get("message") or "")[:160])
             row.setToolTip(d.get("message") or "")
             self._update_summary()
+
+    def _load_thumb(self, row: "JobRow", url: str) -> None:
+        """Fetch video thumbnail off-thread and set it as the row icon."""
+        from PySide6.QtGui import QPixmap
+
+        def work():
+            import urllib.request
+
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "Mozilla/5.0"}
+                )
+                data = urllib.request.urlopen(req, timeout=10).read()
+            except Exception:
+                return
+            pm = QPixmap()
+            pm.loadFromData(data)
+            if pm.isNull():
+                return
+            pm = pm.scaledToHeight(28, Qt.SmoothTransformation)
+            # marshal to GUI thread
+            from PySide6.QtCore import QMetaObject, Q_ARG
+
+            QMetaObject.invokeMethod(
+                row.icon,
+                "setPixmap",
+                Qt.QueuedConnection,
+                Q_ARG("QPixmap", pm),
+            )
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        self._thumb_pool.append(t)
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)

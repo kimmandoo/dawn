@@ -71,6 +71,9 @@ class DownloadJob:
     playlist: bool = False
     proxy: Optional[str] = None       # http/socks5 프록시 — 지역·ISP 차단 우회
     geo_bypass: bool = False          # yt-dlp 지역제한 우회
+    section: Optional[tuple] = None   # (start_s, end_s) seconds, None = whole
+    subtitles: bool = False           # write ko/en subs beside file
+    dedup: bool = True                # skip already-downloaded via archive
 
 
 def _format_selector(quality: str) -> str:
@@ -196,6 +199,21 @@ def _ydl_opts(job: DownloadJob) -> dict:
         opts["proxy"] = job.proxy
     if job.geo_bypass:
         opts["geo_bypass"] = True
+    if job.section:
+        start, end = job.section
+        opts["download_ranges"] = yt_dlp.utils.download_range_func(
+            None, [(start, end)]
+        )
+    if job.subtitles:
+        opts.update(
+            writesubtitles=True,
+            writeautomaticsub=True,
+            subtitleslangs=["ko.*", "en.*", "all", "-live_chat"],
+            postprocessors=(opts.get("postprocessors") or [])
+            + [{"key": "FFmpegSubtitlesConvertor", "format": "srt"}],
+        )
+    if job.dedup:
+        opts["download_archive"] = os.path.join(job.outdir, ".dawn-archive.txt")
     return opts
 
 
@@ -271,11 +289,27 @@ def _try_download(
         except Exception as e:  # noqa: BLE001
             if cancel.is_set():
                 raise Cancelled()
+            msg = str(e)
+            # 자막은 있으면 좋은 것 — 자막 다운로드 실패가 전체 작업을 죽이면 안 됨
+            if job.subtitles and "subtitle" in msg.lower():
+                job = _no_subs(job)
+                continue
             last_exc = e
-            if not _RETRYABLE.search(str(e)):
+            if not _RETRYABLE.search(msg):
                 raise
     assert last_exc is not None
     raise last_exc
+
+
+def _no_subs(job: DownloadJob) -> DownloadJob:
+    """Clone job with subtitles disabled (429/region-locked subs shouldn't
+    kill the media download)."""
+    return DownloadJob(
+        url=job.url, mode=job.mode, outdir=job.outdir, quality=job.quality,
+        cookies=job.cookies, playlist=job.playlist, proxy=job.proxy,
+        geo_bypass=job.geo_bypass, section=job.section,
+        subtitles=False, dedup=job.dedup,
+    )
 
 
 def _final_files(info: dict):
@@ -446,7 +480,13 @@ def run_job(
         if info:
             title = info.get("title") or info.get("id") or ""
             if title:
-                progress({"event": "title", "title": title})
+                progress(
+                    {
+                        "event": "title",
+                        "title": title,
+                        "thumb": _best_thumbnail_url(info),
+                    }
+                )
         if job.mode == "audio" and info:
             _tag_audio_files(info, progress, cancel)
         progress({"event": "done"})
