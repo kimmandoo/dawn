@@ -373,6 +373,48 @@ def _remove_sidecar_thumbs(media_path: str) -> None:
         except OSError:
             pass
 
+
+def _embed_video_covers(info: dict, progress: ProgressCb, cancel: threading.Event) -> None:
+    """Attach square-cropped thumbnail as MP4 cover art (attached_pic) so
+    players show it as the poster during playback too."""
+    import subprocess
+    import tempfile
+
+    for ent, path in _final_files(info):
+        if cancel.is_set():
+            raise Cancelled()
+        if not path.lower().endswith(".mp4") or not os.path.exists(path):
+            continue
+        try:
+            raw = _fetch_thumbnail(ent) or _sidecar_thumbnail(path)
+            jpeg = _square_jpeg(raw) if raw else None
+            _remove_sidecar_thumbs(path)
+            if not jpeg:
+                continue
+            fd, jpg = tempfile.mkstemp(suffix=".jpg")
+            with os.fdopen(fd, "wb") as f:
+                f.write(jpeg)
+            tmp = path + ".cov.mp4"
+            rc = subprocess.run(
+                [_FFMPEG_EXE, "-y", "-i", path, "-i", jpg,
+                 "-map", "0", "-map", "1", "-c", "copy",
+                 "-disposition:v:1", "attached_pic", tmp],
+                capture_output=True,
+            ).returncode
+            os.unlink(jpg)
+            if rc == 0 and os.path.exists(tmp):
+                os.replace(tmp, path)
+                progress({"event": "pp", "name": "cover", "path": path})
+            else:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        except Cancelled:
+            raise
+        except Exception:
+            pass  # cover must never fail the download
+
 # ---------------------------------------------------------------------------
 # Album art: fetch thumbnail -> center-crop to square -> embed via mutagen.
 # ---------------------------------------------------------------------------
@@ -629,6 +671,8 @@ def run_job(
                 )
         if job.mode == "audio" and info:
             _tag_audio_files(info, progress, cancel)
+        elif info:
+            _embed_video_covers(info, progress, cancel)
         progress({"event": "done"})
     except Cancelled:
         progress({"event": "cancelled"})

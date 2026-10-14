@@ -459,9 +459,19 @@ class MainWindow(QMainWindow):
         self.adv_btn.toggled.connect(self._toggle_adv)
         lay.addWidget(self.adv_btn)
 
+        from PySide6.QtWidgets import QScrollArea
+
         self.adv = QFrame()
         self.adv.setObjectName("advBox")
-        adv_lay = QVBoxLayout(self.adv)
+        adv_wrap = QVBoxLayout(self.adv)
+        adv_wrap.setContentsMargins(0, 0, 0, 0)
+        adv_scroll = QScrollArea()
+        adv_scroll.setWidgetResizable(True)
+        adv_scroll.setFrameShape(QScrollArea.NoFrame)
+        adv_scroll.setMaximumHeight(340)
+        adv_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        adv_inner = QWidget()
+        adv_lay = QVBoxLayout(adv_inner)
         adv_lay.setContentsMargins(12, 10, 12, 10)
         adv_lay.setSpacing(8)
 
@@ -553,6 +563,8 @@ class MainWindow(QMainWindow):
         par_row.addWidget(self.parallel_spin)
         par_row.addStretch(1)
         adv_lay.addLayout(par_row)
+        adv_scroll.setWidget(adv_inner)
+        adv_wrap.addWidget(adv_scroll)
         lay.addWidget(self.adv)
 
         # Queue
@@ -1025,7 +1037,13 @@ class MainWindow(QMainWindow):
             pm.loadFromData(data)
             if pm.isNull():
                 return
-            pm = pm.scaled(48, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            # center-crop to square like the embedded album art
+            if pm.width() != pm.height():
+                side = min(pm.width(), pm.height())
+                pm = pm.copy(
+                    (pm.width() - side) // 2, (pm.height() - side) // 2, side, side
+                )
+            pm = pm.scaled(30, 30, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             # marshal to GUI thread
             from PySide6.QtCore import QMetaObject, Q_ARG
 
