@@ -69,6 +69,8 @@ class DownloadJob:
     quality: str = "best"  # video: 'best'|'1080'|'720'|'480'; audio: '0'|'320'|'192'|'128'
     cookies: CookieConfig = field(default_factory=CookieConfig)
     playlist: bool = False
+    proxy: Optional[str] = None       # http/socks5 프록시 — 지역·ISP 차단 우회
+    geo_bypass: bool = False          # yt-dlp 지역제한 우회
 
 
 def _format_selector(quality: str) -> str:
@@ -159,6 +161,10 @@ def _ydl_opts(job: DownloadJob) -> dict:
         opts["format"] = _format_selector(job.quality)
         opts["merge_output_format"] = "mp4"
         opts["postprocessors"] = [{"key": "FFmpegMetadata"}]
+    if job.proxy:
+        opts["proxy"] = job.proxy
+    if job.geo_bypass:
+        opts["geo_bypass"] = True
     return opts
 
 

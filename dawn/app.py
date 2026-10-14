@@ -421,6 +421,24 @@ class MainWindow(QMainWindow):
 
         self.playlist_chk = QCheckBox("재생목록 링크는 항상 전체 다운로드")
         adv_lay.addWidget(self.playlist_chk)
+
+        bypass_lbl = QLabel(
+            "국가·ISP 차단 우회 (warning.or.kr 등): 로컬/원격 프록시 경유\n"
+            "예) socks5://127.0.0.1:1080  ·  http://127.0.0.1:8080"
+        )
+        bypass_lbl.setWordWrap(True)
+        bypass_lbl.setObjectName("hint")
+        adv_lay.addWidget(bypass_lbl)
+
+        px_row = QHBoxLayout()
+        px_row.addWidget(QLabel("프록시"))
+        self.proxy_edit = QLineEdit()
+        self.proxy_edit.setPlaceholderText("비워두면 직접 연결")
+        px_row.addWidget(self.proxy_edit, 1)
+        adv_lay.addLayout(px_row)
+
+        self.geo_chk = QCheckBox("지역 제한 우회 (yt-dlp geo-bypass)")
+        adv_lay.addWidget(self.geo_chk)
         self.adv.hide()
         lay.addWidget(self.adv)
 
@@ -513,6 +531,8 @@ class MainWindow(QMainWindow):
                 self.browser_combo.setCurrentIndex(i)
         self.cookie_file_edit.setText(self.settings.value("cookie_file", ""))
         self.playlist_chk.setChecked(self.settings.value("playlist", False, type=bool))
+        self.proxy_edit.setText(self.settings.value("proxy", ""))
+        self.geo_chk.setChecked(self.settings.value("geo_bypass", False, type=bool))
         if self.settings.value("adv_open", False, type=bool):
             self.adv_btn.setChecked(True)
 
@@ -532,6 +552,8 @@ class MainWindow(QMainWindow):
         self.settings.setValue("cookie_file", self.cookie_file_edit.text())
         self.settings.setValue("playlist", self.playlist_chk.isChecked())
         self.settings.setValue("adv_open", self.adv_btn.isChecked())
+        self.settings.setValue("proxy", self.proxy_edit.text())
+        self.settings.setValue("geo_bypass", self.geo_chk.isChecked())
 
     # ----- actions -----
 
@@ -620,6 +642,8 @@ class MainWindow(QMainWindow):
                 cookie_file=self.cookie_file_edit.text().strip() or None,
             ),
             playlist=self._resolve_playlist(url, playlist_cache),
+            proxy=self.proxy_edit.text().strip() or None,
+            geo_bypass=self.geo_chk.isChecked(),
         )
         self._add_row(job)
         self._update_summary()
