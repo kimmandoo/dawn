@@ -336,9 +336,6 @@ class JobRow(QFrame):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    update_found = Signal(str, str)   # tag, asset_url
-    update_done = Signal(str)         # extracted path (restarting)
-    update_failed = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -379,11 +376,6 @@ class MainWindow(QMainWindow):
         if self.clip_chk.isChecked():
             self._clip_timer.start()
 
-        # 자동 업데이트 확인 (시작 3초 뒤, 백그라운드)
-        self.update_found.connect(self._on_update_found)
-        self.update_done.connect(self._on_update_done)
-        self.update_failed.connect(self._on_update_failed)
-        QTimer.singleShot(3000, self._check_update)
 
     # ----- UI -----
 
@@ -417,25 +409,6 @@ class MainWindow(QMainWindow):
         header.addStretch(1)
         lay.addLayout(header)
 
-        # 업데이트 배너 (새 버전 있을 때만 보임)
-        self.upd_bar = QFrame()
-        self.upd_bar.setObjectName("advBox")
-        ub = QHBoxLayout(self.upd_bar)
-        ub.setContentsMargins(12, 8, 12, 8)
-        self.upd_lbl = QLabel()
-        self.upd_lbl.setWordWrap(True)
-        self.upd_btn = QPushButton("업데이트")
-        self.upd_btn.setObjectName("accentBtn")
-        self.upd_btn.clicked.connect(self._do_update)
-        self.upd_prog = QProgressBar()
-        self.upd_prog.setFixedWidth(120)
-        self.upd_prog.hide()
-        ub.addWidget(self.upd_lbl, 1)
-        ub.addWidget(self.upd_prog)
-        ub.addWidget(self.upd_btn)
-        self.upd_bar.hide()
-        lay.addWidget(self.upd_bar)
-        self._upd_url = None
 
         # URL input (paste -> auto download)
         url_row = QHBoxLayout()
@@ -1022,6 +995,8 @@ class MainWindow(QMainWindow):
             row.set_state("error", (d.get("message") or "")[:160])
             row.setToolTip(d.get("message") or "")
             self._update_summary()
+        elif ev == "warn":
+            row.setToolTip(d.get("message") or "")
 
     def _load_thumb(self, row: "JobRow", url: str) -> None:
         """Fetch video thumbnail off-thread and set it as the row icon."""
@@ -1056,76 +1031,6 @@ class MainWindow(QMainWindow):
         t.start()
         self._thumb_pool.append(t)
 
-    # ----- auto update -----
-
-    def _check_update(self) -> None:
-        def work():
-            try:
-                from . import __version__, updater
-
-                res = updater.check_latest()
-                if res and updater.is_newer(res[0], __version__):
-                    self.update_found.emit(res[0], res[1])
-            except Exception:
-                pass  # update check failure is silent
-
-        threading.Thread(target=work, daemon=True).start()
-
-    @Slot(str, str)
-    def _on_update_found(self, tag: str, url: str) -> None:
-        from . import updater
-
-        self._upd_url = url
-        self.upd_lbl.setText(
-            f"새 버전 <b>{tag}</b> 이 있습니다." + ("" if url else " (이 플랫폼용 파일 없음)")
-        )
-        self.upd_btn.setText(
-            "업데이트" if url and updater.is_frozen() else "다운로드 페이지"
-        )
-        self.upd_bar.show()
-
-    def _do_update(self) -> None:
-        from . import updater
-
-        url = self._upd_url
-        if not url or not updater.is_frozen():
-            QDesktopServices.openUrl(QUrl(updater.RELEASES_PAGE))
-            return
-        self.upd_btn.setEnabled(False)
-        self.upd_prog.setRange(0, 100)
-        self.upd_prog.show()
-
-        from PySide6.QtCore import Q_ARG, QMetaObject
-
-        def work():
-            try:
-                zip_path = updater.download(
-                    url,
-                    lambda f: QMetaObject.invokeMethod(
-                        self.upd_prog, "setValue", Qt.QueuedConnection,
-                        Q_ARG(int, int(f * 100)),
-                    ),
-                )
-                updater.apply_and_restart(zip_path)
-                self.update_done.emit(zip_path)
-            except Exception as e:
-                self.update_failed.emit(str(e))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    @Slot(str)
-    def _on_update_done(self, _path: str) -> None:
-        self.upd_lbl.setText("업데이트 적용 중… 앱을 재시작합니다.")
-        QTimer.singleShot(600, self.close)
-
-    @Slot(str)
-    def _on_update_failed(self, msg: str) -> None:
-        self.upd_prog.hide()
-        self.upd_btn.setEnabled(True)
-        self.upd_btn.setText("다운로드 페이지")
-        self.upd_lbl.setText(
-            f"자동 업데이트 실패 — 수동 설치해 주세요.<br><small>{msg[:120]}</small>"
-        )
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)

@@ -185,6 +185,7 @@ def _ydl_opts(job: DownloadJob) -> dict:
     opts.update(job.cookies.ydl_opts())
     if job.mode == "audio":
         opts["format"] = "ba/b"
+        opts["writethumbnail"] = True  # yt-dlp fetches w/ its cookies+proxy → more reliable than raw urllib
         pp = {"key": "FFmpegExtractAudio", "preferredcodec": job.audio_codec}
         if job.audio_codec != "flac":  # lossless: bitrate flag is meaningless
             pp["preferredquality"] = job.quality
@@ -331,7 +332,7 @@ def _tag_audio_files(info: dict, progress: ProgressCb, cancel: threading.Event) 
         if ext not in (".mp3", ".m4a", ".flac") or not os.path.exists(path):
             continue
         try:
-            raw = _fetch_thumbnail(ent)
+            raw = _fetch_thumbnail(ent) or _sidecar_thumbnail(path)
             jpeg = _square_jpeg(raw) if raw else None
             if ext == ".mp3":
                 embed_audio_metadata(path, ent, jpeg)
@@ -339,11 +340,38 @@ def _tag_audio_files(info: dict, progress: ProgressCb, cancel: threading.Event) 
                 embed_m4a_metadata(path, ent, jpeg)
             else:
                 embed_flac_metadata(path, ent, jpeg)
+            _remove_sidecar_thumbs(path)
             progress({"event": "pp", "name": "tag+art", "path": path})
+            if jpeg is None:
+                progress({"event": "warn", "message": "앨범아트를 가져오지 못했습니다"})
         except Cancelled:
             raise
         except Exception:
             pass  # tagging must never fail the download
+
+
+def _sidecar_thumbnail(media_path: str) -> Optional[bytes]:
+    """Read the thumbnail yt-dlp's writethumbnail saved beside the file
+    (same basename, image ext). Returns bytes or None."""
+    stem = os.path.splitext(media_path)[0]
+    for ext in (".webp", ".jpg", ".jpeg", ".png"):
+        p = stem + ext
+        try:
+            if os.path.exists(p):
+                with open(p, "rb") as f:
+                    return f.read()
+        except OSError:
+            pass
+    return None
+
+
+def _remove_sidecar_thumbs(media_path: str) -> None:
+    stem = os.path.splitext(media_path)[0]
+    for ext in (".webp", ".jpg", ".jpeg", ".png"):
+        try:
+            os.remove(stem + ext)
+        except OSError:
+            pass
 
 # ---------------------------------------------------------------------------
 # Album art: fetch thumbnail -> center-crop to square -> embed via mutagen.
