@@ -111,6 +111,31 @@ def is_playlist_url(url: str) -> bool:
     return bool(PLAYLIST_RE.search(url))
 
 
+class ElidedLabel(QLabel):
+    """QLabel that right-elides long text instead of clipping mid-glyph."""
+
+    def __init__(self, text="", parent=None):
+        self._full = text
+        super().__init__(text, parent)
+
+    def setText(self, t) -> None:
+        self._full = t
+        super().setText(t)
+        self._elide()
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._elide()
+
+    def _elide(self) -> None:
+        w = self.width() - 4
+        if w > 10 and self._full:
+            super().setText(
+                self.fontMetrics().elidedText(self._full, Qt.ElideRight, w)
+            )
+
+
+
 # ---------------------------------------------------------------------------
 # Worker thread: FIFO queue of jobs, sequential download.
 # ---------------------------------------------------------------------------
@@ -207,10 +232,10 @@ class JobRow(QFrame):
         self.outdir = ""
 
         self.icon = QLabel("🎬" if mode == "video" else "🎵")
-        self.icon.setFixedWidth(40)
-        self.icon.setFixedHeight(28)
+        self.icon.setFixedSize(48, 30)
         self.icon.setAlignment(Qt.AlignCenter)
-        self.title = QLabel(url)
+        self.title = ElidedLabel(url)
+        self.title.setToolTip(url)
         self.title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.cancel_btn = QPushButton("✕")
         self.cancel_btn.setFixedSize(24, 24)
@@ -318,7 +343,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(660, 700)
+        self.resize(660, 780)
+        self.setMinimumSize(560, 600)
         self.setAcceptDrops(True)
         self.settings = QSettings("Dawn", "Dawn")
         self._next_id = 1
@@ -427,7 +453,7 @@ class MainWindow(QMainWindow):
         # Mode toggle
         mode_row = QHBoxLayout()
         self.btn_video = QPushButton("🎬  영상 + 음원 (MP4)")
-        self.btn_audio = QPushButton("🎵  음원만 (MP3 · 앨범아트)")
+        self.btn_audio = QPushButton("🎵  음원만 (MP3·M4A·FLAC)")
         for b in (self.btn_video, self.btn_audio):
             b.setCheckable(True)
             b.setMinimumHeight(44)
@@ -454,7 +480,7 @@ class MainWindow(QMainWindow):
         lay.addLayout(opt_row)
 
         # Advanced: cookies / playlist
-        self.adv_btn = QPushButton("⚙ 성인 인증 · 쿠키 · 재생목록 ▾")
+        self.adv_btn = QPushButton("⚙ 고급 설정 (인증 · 프록시 · 자막 · 구간 · 병렬) ▾")
         self.adv_btn.setCheckable(True)
         self.adv_btn.setObjectName("advBtn")
         self.adv_btn.toggled.connect(self._toggle_adv)
@@ -624,6 +650,14 @@ class MainWindow(QMainWindow):
             }
             QProgressBar::chunk { border-radius: 5px; background: #FF8F3D; }
             QToolTip { background: #3E2723; color: #FFF6E3; border: none; padding: 6px; }
+            #accentBtn { background: #FF8F3D; border-color: #E8721C; color: #fff; font-weight: 700; }
+            #accentBtn:hover { background: #F57C00; }
+            #accentBtn:disabled { background: #DCCB9E; border-color: #DCCB9E; }
+            QSpinBox {
+                background: #FFFBEF; border: 2px solid #DCCB9E; border-radius: 8px;
+                padding: 4px 8px; min-width: 54px;
+            }
+            QSpinBox:focus { border-color: #FF8F3D; }
             """
         )
 
@@ -704,7 +738,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_adv(self, on: bool) -> None:
         self.adv.setVisible(on)
-        self.adv_btn.setText("⚙ 성인 인증 · 쿠키 · 재생목록 " + ("▴" if on else "▾"))
+        self.adv_btn.setText("⚙ 고급 설정 (인증 · 프록시 · 자막 · 구간 · 병렬) " + ("▴" if on else "▾"))
 
     def _paste(self) -> None:
         self.url_edit.setText(QApplication.clipboard().text().strip())
@@ -902,6 +936,7 @@ class MainWindow(QMainWindow):
         if not self._rows:
             self.empty_hint.resize(self.list.width(), 60)
             self.empty_hint.move(0, int(self.list.height() * 0.3))
+            self.empty_hint.raise_()
 
     def _add_row(self, job: DownloadJob) -> None:
         job_id = self._next_id
@@ -1006,7 +1041,7 @@ class MainWindow(QMainWindow):
             pm.loadFromData(data)
             if pm.isNull():
                 return
-            pm = pm.scaledToHeight(28, Qt.SmoothTransformation)
+            pm = pm.scaled(48, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             # marshal to GUI thread
             from PySide6.QtCore import QMetaObject, Q_ARG
 
