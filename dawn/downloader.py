@@ -379,7 +379,9 @@ def _remove_sidecar_thumbs(media_path: str) -> None:
 
 
 def _square_jpeg(img_bytes: bytes, size: int = 1280) -> Optional[bytes]:
-    """Center-crop to a square and re-encode as JPEG."""
+    """Letterbox-strip → center-crop to a square → JPEG.
+    YouTube hq/sddefault thumbnails bake black bars into the image; a naive
+    square crop keeps them, so scan for near-black top/bottom rows first."""
     import io
 
     from PIL import Image
@@ -391,6 +393,43 @@ def _square_jpeg(img_bytes: bytes, size: int = 1280) -> Optional[bytes]:
             img = img.convert("RGB")
         elif img.mode == "L":
             img = img.convert("RGB")
+
+        # ---- letterbox / pillarbox detection ----
+        W, H = img.size
+        gw = 160
+        gh = max(1, int(H * gw / W))
+        gray = img.convert("L").resize((gw, gh), Image.BILINEAR)
+        px = list(gray.getdata())
+        row_mean = [sum(px[r * gw : (r + 1) * gw]) / gw for r in range(gh)]
+        col_mean = [sum(px[c::gw]) / gh for c in range(gw)] if gh else []
+        THRESH = 16  # near-black
+
+        top = 0
+        while top < gh and row_mean[top] < THRESH:
+            top += 1
+        bot = gh
+        while bot > top and row_mean[bot - 1] < THRESH:
+            bot -= 1
+        left = 0
+        while left < gw and col_mean[left] < THRESH:
+            left += 1
+        right = gw
+        while right > left and col_mean[right - 1] < THRESH:
+            right -= 1
+
+        # only crop bars >3% of that dimension — avoids eating legit dark content
+        y0 = int(top / gh * H) if top > gh * 0.03 else 0
+        y1 = int(bot / gh * H) if (gh - bot) > gh * 0.03 else H
+        x0 = int(left / gw * W) if left > gw * 0.03 else 0
+        x1 = int(right / gw * W) if (gw - right) > gw * 0.03 else W
+        if y1 - y0 < H * 0.4:  # never crop below 40% height — pathological
+            y0, y1 = 0, H
+        if x1 - x0 < W * 0.4:
+            x0, x1 = 0, W
+        if (x0, y0, x1, y1) != (0, 0, W, H):
+            img = img.crop((x0, y0, x1, y1))
+
+        # ---- center square crop ----
         w, h = img.size
         side = min(w, h)
         left, top = (w - side) // 2, (h - side) // 2

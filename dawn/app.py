@@ -246,8 +246,8 @@ class JobRow(QFrame):
         self.retry_btn.setToolTip("다시 시도")
         self.retry_btn.clicked.connect(self.retryRequested)
         self.retry_btn.hide()
-        self.folder_btn = QPushButton("📂")
-        self.folder_btn.setFixedSize(24, 24)
+        self.folder_btn = QPushButton("폴더")
+        self.folder_btn.setFixedSize(44, 24)
         self.folder_btn.setToolTip("저장 폴더 열기")
         self.folder_btn.hide()
 
@@ -569,16 +569,28 @@ class MainWindow(QMainWindow):
         self.list = QListWidget()
         self.list.setSpacing(4)
         self.list.itemDoubleClicked.connect(self._open_row_folder)
-        lay.addWidget(self.list, 1)
 
-        self.empty_hint = QLabel(
-            "여기로 링크를 드래그하거나\n위 칸에 붙여넣으세요", self.list
-        )
-        self.empty_hint.setObjectName("appSub")
-        self.empty_hint.setAlignment(Qt.AlignCenter)
-        self.empty_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.empty_hint.setStyleSheet("color: #C9B88A; font-size: 14px;")
-        self.empty_hint.resize(self.list.width(), 60)
+        # 빈 상태 ↔ 목록: 스택으로 전환 (오버레이 좌표 버그 방지)
+        from PySide6.QtWidgets import QStackedWidget
+
+        self.stack = QStackedWidget()
+        empty_page = QWidget()
+        empty_page.setObjectName("emptyPage")
+        ep = QVBoxLayout(empty_page)
+        ep.addStretch(1)
+        big = QLabel("⬇")
+        big.setAlignment(Qt.AlignCenter)
+        big.setStyleSheet("color: #C9B88A; font-size: 30px;")
+        empty_txt = QLabel("여기로 링크를 드래그하거나\n위 칸에 붙여넣으세요")
+        empty_txt.setAlignment(Qt.AlignCenter)
+        empty_txt.setStyleSheet("color: #C9B88A; font-size: 15px;")
+        ep.addWidget(big)
+        ep.addWidget(empty_txt)
+        ep.addStretch(1)
+        self.stack.addWidget(empty_page)
+        self.stack.addWidget(self.list)
+        self.stack.setCurrentIndex(0)
+        lay.addWidget(self.stack, 1)
 
         hint = QLabel("목록 항목 더블클릭 → 저장 폴더 열기")
         hint.setObjectName("appSub")
@@ -614,9 +626,10 @@ class MainWindow(QMainWindow):
             #advBtn:hover { color: #3E2723; }
             #ghostBtn { border: none; color: #8D6E63; }
             #ghostBtn:hover { color: #3E2723; text-decoration: underline; }
-            QListWidget {
+            QListWidget, #emptyPage {
                 background: #FFF9EA; border: 2px solid #DCCB9E; border-radius: 10px;
             }
+            #emptyPage { border-style: dashed; }
             QListWidget::item { border: none; }
             QProgressBar {
                 border: none; border-radius: 5px; background: #EFE3C3;
@@ -820,7 +833,7 @@ class MainWindow(QMainWindow):
         end = to_sec(self.sec_end.text())
         if start is None and end is None:
             return None
-        return (start or 0, end if end is not None else float("inf"))
+        return (start or 0, end)  # end None = 영상 끝까지 (yt-dlp는 None 지원)
 
     def _clipboard_tick(self) -> None:
         if not self.clip_chk.isChecked():
@@ -905,11 +918,7 @@ class MainWindow(QMainWindow):
             if n_fail:
                 bits.append(f"실패 {n_fail}")
             self.summary_lbl.setText(" · ".join(bits))
-        self.empty_hint.setVisible(not self._rows)
-        if not self._rows:
-            self.empty_hint.resize(self.list.width(), 60)
-            self.empty_hint.move(0, int(self.list.height() * 0.3))
-            self.empty_hint.raise_()
+        self.stack.setCurrentIndex(0 if not self._rows else 1)
 
     def _add_row(self, job: DownloadJob) -> None:
         job_id = self._next_id
@@ -1034,9 +1043,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
-        if hasattr(self, "empty_hint") and self.empty_hint.isVisible():
-            self.empty_hint.resize(self.list.width(), 60)
-            self.empty_hint.move(0, int(self.list.height() * 0.3))
+        # empty/list 전환은 QStackedWidget이 처리 — 수동 reposition 불필요
 
     # ----- lifecycle -----
 
@@ -1053,6 +1060,20 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("Dawn")
+    from PySide6.QtGui import QFont
+
+    # Platform-native UI font + emoji-capable fallbacks (offscreen/minimal
+    # systems render emoji as boxes without these)
+    families = {
+        "darwin": ["SF Pro Text", "Apple SD Gothic Neo", "Helvetica Neue",
+                   "Apple Color Emoji", "Arial"],
+        "win32": ["Malgun Gothic", "Segoe UI", "Microsoft YaHei",
+                  "Segoe UI Emoji", "Arial"],
+    }.get(sys.platform, ["Noto Sans", "DejaVu Sans", "Noto Color Emoji"])
+    f = QFont()
+    f.setFamilies(families)
+    f.setPointSize(10)
+    app.setFont(f)
     icon_path = _res("icon.png")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
