@@ -5,15 +5,20 @@ Build:
     pyinstaller dawn.spec --noconfirm
 """
 import sys
+from shutil import which
 
 from PyInstaller.utils.hooks import collect_data_files
 
 ONE_FILE = sys.platform != "darwin"
 
+# Bundle deno (JS challenge runtime for yt-dlp) so users never install it.
+_deno = which("deno")
+_extra_bins = [(_deno, ".")] if _deno else []
+
 a = Analysis(
     ["main.py"],
     pathex=[],
-    binaries=[],
+    binaries=_extra_bins,
     datas=collect_data_files("yt_dlp_ejs") + collect_data_files("imageio_ffmpeg"),
     hiddenimports=["imageio_ffmpeg", "yt_dlp_ejs"],
     noarchive=False,

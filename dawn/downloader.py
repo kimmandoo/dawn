@@ -37,16 +37,6 @@ def _find_ffmpeg() -> str:
 _FFMPEG_EXE = _find_ffmpeg()
 
 
-def ffmpeg_location() -> str:
-    return _FFMPEG_EXE
-
-
-def system_ffmpeg() -> Optional[str]:
-    """Path to a system ffmpeg if the bundled one is unusable."""
-    from shutil import which
-
-    return which("ffmpeg")
-
 
 class Cancelled(Exception):
     pass
@@ -103,24 +93,36 @@ class _NullLogger:
 
 
 def _js_runtimes() -> dict:
-    """Enable deno for yt-dlp's JS challenge solving (n-sig / bot checks).
-    Searches PATH plus common install locations not on GUI-app PATHs."""
+    """Locate deno for yt-dlp's JS challenge solving (n-sig / bot checks).
+    Bundled copy (PyInstaller) -> PATH -> common install dirs. When nothing
+    is found, return {'deno': {}} so yt-dlp still tries its own discovery —
+    {} would DISABLE the default runtime entirely."""
+    import sys
     from shutil import which
 
-    path = which("deno")
-    if not path:
-        for cand in (
-            os.path.expanduser("~/.deno/bin/deno"),
-            "/opt/homebrew/bin/deno",
-            "/usr/local/bin/deno",
-            os.path.join(os.environ.get("USERPROFILE", ""), ".deno", "bin", "deno.exe"),
-        ):
-            if os.path.exists(cand):
-                path = cand
-                break
-    if not path:
-        return {}
-    return {"deno": {"path": path}}
+    exe = "deno.exe" if sys.platform == "win32" else "deno"
+    candidates = [
+        os.path.join(getattr(sys, "_MEIPASS", "") or "", exe),
+        os.path.join(os.path.dirname(sys.argv[0]), exe),
+        which("deno") or "",
+        os.path.expanduser("~/.deno/bin/deno"),
+        "/opt/homebrew/bin/deno",
+        "/usr/local/bin/deno",
+        os.path.join(os.environ.get("USERPROFILE", ""), ".deno", "bin", "deno.exe"),
+        os.path.join(
+            os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Packages",
+        ),  # winget layouts vary; covered below by glob
+    ]
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            return {"deno": {"path": cand}}
+    # winget Links dir
+    links = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Links", "deno.exe"
+    )
+    if os.path.isfile(links):
+        return {"deno": {"path": links}}
+    return {"deno": {}}
 
 
 def _ydl_opts(job: DownloadJob) -> dict:
@@ -137,7 +139,8 @@ def _ydl_opts(job: DownloadJob) -> dict:
         "no_warnings": True,
         "windowsfilenames": True,
         "retries": 3,
-        "concurrent_fragment_downloads": 4,
+        "concurrent_fragment_downloads": 8,
+        "http_chunk_size": 10 * 1024 * 1024,
         "logger": _NullLogger(),
         "js_runtimes": _js_runtimes(),
         "remote_components": ["ejs:github"],
@@ -257,10 +260,15 @@ def _tag_audio_files(info: dict, progress: ProgressCb, cancel: threading.Event) 
             raise Cancelled()
         if not path.lower().endswith(".mp3") or not os.path.exists(path):
             continue
-        raw = _fetch_thumbnail(ent)
-        jpeg = _square_jpeg(raw) if raw else None
-        embed_audio_metadata(path, ent, jpeg)
-        progress({"event": "pp", "name": "tag+art", "path": path})
+        try:
+            raw = _fetch_thumbnail(ent)
+            jpeg = _square_jpeg(raw) if raw else None
+            embed_audio_metadata(path, ent, jpeg)
+            progress({"event": "pp", "name": "tag+art", "path": path})
+        except Cancelled:
+            raise
+        except Exception:
+            pass  # tagging must never fail the download
 
 # ---------------------------------------------------------------------------
 # Album art: fetch thumbnail -> center-crop to square -> embed via mutagen.

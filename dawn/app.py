@@ -64,7 +64,7 @@ AUDIO_QUALITIES = [
     ("192 kbps", "192"),
     ("128 kbps", "128"),
 ]
-URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s]*\.[^\s/][^\s]*", re.IGNORECASE)  # host must contain a dot — avoids partial-URL autostart
 PLAYLIST_RE = re.compile(r"[?&]list=", re.IGNORECASE)
 
 STATUS_TEXT = {
@@ -501,11 +501,12 @@ class MainWindow(QMainWindow):
         if not urls:
             self.url_edit.setPlaceholderText("🔗 링크를 붙여넣으세요! (https://…)")
             return
+        playlist_cache = {}  # don't re-ask the same playlist choice per batch
         for url in urls:
-            self._enqueue_url(url)
+            self._enqueue_url(url, playlist_cache)
         self.url_edit.clear()
 
-    def _enqueue_url(self, url: str) -> None:
+    def _enqueue_url(self, url: str, playlist_cache: dict | None = None) -> None:
         """Enqueue one URL (shared by paste, Enter, drag&drop)."""
         if self._url_active(url):
             return
@@ -520,25 +521,30 @@ class MainWindow(QMainWindow):
                 browser=self.browser_combo.currentData(),
                 cookie_file=self.cookie_file_edit.text().strip() or None,
             ),
-            playlist=self._resolve_playlist(url),
+            playlist=self._resolve_playlist(url, playlist_cache),
         )
         self._add_row(job)
         self._update_summary()
 
-    def _resolve_playlist(self, url: str) -> bool:
+    def _resolve_playlist(self, url: str, cache: dict | None = None) -> bool:
         if not is_playlist_url(url):
             return False
         if self.playlist_chk.isChecked():
             return True
+        if cache is not None and url in cache:
+            return cache[url]
         box = QMessageBox(self)
         box.setWindowTitle("재생목록 감지")
         box.setText("이 링크는 재생목록을 포함하고 있습니다.")
         box.setInformativeText("재생목록 전체를 받을까요, 이 영상만 받을까요?")
         all_btn = box.addButton("재생목록 전체", QMessageBox.AcceptRole)
-        one_btn = box.addButton("이 영상만", QMessageBox.RejectRole)
+        box.addButton("이 영상만", QMessageBox.RejectRole)
         box.setDefaultButton(all_btn)
         box.exec()
-        return box.clickedButton() is all_btn
+        result = box.clickedButton() is all_btn
+        if cache is not None:
+            cache[url] = result
+        return result
 
     def _url_active(self, url: str) -> bool:
         for _item, row in self._rows.values():
