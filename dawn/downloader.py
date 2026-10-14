@@ -67,6 +67,7 @@ class DownloadJob:
     mode: str = "video"  # 'video' | 'audio'
     outdir: str = ""
     quality: str = "best"  # video: 'best'|'1080'|'720'|'480'; audio: '0'|'320'|'192'|'128'
+    audio_codec: str = "mp3"  # 'mp3' | 'm4a' | 'flac'
     cookies: CookieConfig = field(default_factory=CookieConfig)
     playlist: bool = False
     proxy: Optional[str] = None       # http/socks5 프록시 — 지역·ISP 차단 우회
@@ -184,13 +185,10 @@ def _ydl_opts(job: DownloadJob) -> dict:
     opts.update(job.cookies.ydl_opts())
     if job.mode == "audio":
         opts["format"] = "ba/b"
-        opts["postprocessors"] = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": job.quality,  # <=10 -> VBR scale, >10 -> -b:a Nk CBR
-            }
-        ]
+        pp = {"key": "FFmpegExtractAudio", "preferredcodec": job.audio_codec}
+        if job.audio_codec != "flac":  # lossless: bitrate flag is meaningless
+            pp["preferredquality"] = job.quality
+        opts["postprocessors"] = [pp]
     else:
         opts["format"] = _format_selector(job.quality)
         opts["merge_output_format"] = "mp4"
@@ -308,7 +306,7 @@ def _no_subs(job: DownloadJob) -> DownloadJob:
         url=job.url, mode=job.mode, outdir=job.outdir, quality=job.quality,
         cookies=job.cookies, playlist=job.playlist, proxy=job.proxy,
         geo_bypass=job.geo_bypass, section=job.section,
-        subtitles=False, dedup=job.dedup,
+        subtitles=False, dedup=job.dedup, audio_codec=job.audio_codec,
     )
 
 
@@ -329,12 +327,18 @@ def _tag_audio_files(info: dict, progress: ProgressCb, cancel: threading.Event) 
     for ent, path in _final_files(info):
         if cancel.is_set():
             raise Cancelled()
-        if not path.lower().endswith(".mp3") or not os.path.exists(path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".mp3", ".m4a", ".flac") or not os.path.exists(path):
             continue
         try:
             raw = _fetch_thumbnail(ent)
             jpeg = _square_jpeg(raw) if raw else None
-            embed_audio_metadata(path, ent, jpeg)
+            if ext == ".mp3":
+                embed_audio_metadata(path, ent, jpeg)
+            elif ext == ".m4a":
+                embed_m4a_metadata(path, ent, jpeg)
+            else:
+                embed_flac_metadata(path, ent, jpeg)
             progress({"event": "pp", "name": "tag+art", "path": path})
         except Cancelled:
             raise
@@ -430,6 +434,75 @@ def embed_audio_metadata(mp3_path: str, info: dict, cover_jpeg: Optional[bytes])
         tags.save(mp3_path, v2_version=3)
     except Exception:
         pass
+
+
+def _meta(info: dict):
+    """Shared title/artist/album/date extraction."""
+    title = info.get("track") or info.get("title")
+    artist = (
+        info.get("artist")
+        or info.get("creator")
+        or info.get("uploader")
+        or info.get("channel")
+    )
+    album = info.get("album") or info.get("playlist") or info.get("playlist_title")
+    date = str(info.get("upload_date") or "")  # 'YYYYMMDD'
+    date = f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else None
+    return title, artist, album, date
+
+
+def embed_m4a_metadata(path: str, info: dict, cover_jpeg: Optional[bytes]) -> None:
+    """MP4 atoms: ©nam/©ART/©alb/©day + covr artwork."""
+    from mutagen.mp4 import MP4, MP4Cover
+
+    audio = MP4(path)
+    title, artist, album, date = _meta(info)
+    if title:
+        audio["©nam"] = [title]
+    if artist:
+        audio["©ART"] = [artist]
+        audio["aART"] = [artist]
+    if album:
+        audio["©alb"] = [album]
+    if date:
+        audio["©day"] = [date]
+    if cover_jpeg:
+        audio["covr"] = [MP4Cover(cover_jpeg, imageformat=MP4Cover.FORMAT_JPEG)]
+    audio.save()
+
+
+def embed_flac_metadata(path: str, info: dict, cover_jpeg: Optional[bytes]) -> None:
+    """Vorbis comments + Picture block."""
+    from mutagen.flac import FLAC, Picture
+
+    audio = FLAC(path)
+    title, artist, album, date = _meta(info)
+    if title:
+        audio["title"] = title
+    if artist:
+        audio["artist"] = artist
+    if album:
+        audio["album"] = album
+    if date:
+        audio["date"] = date
+    if cover_jpeg:
+        from io import BytesIO
+
+        from PIL import Image
+
+        pic = Picture()
+        pic.type = 3
+        pic.mime = "image/jpeg"
+        pic.desc = "Cover"
+        pic.data = cover_jpeg
+        try:
+            with Image.open(BytesIO(cover_jpeg)) as im:
+                pic.width, pic.height = im.size
+        except Exception:
+            pass
+        audio.clear_pictures()
+        audio.add_picture(pic)
+    audio.save()
 
 
 # ---------------------------------------------------------------------------

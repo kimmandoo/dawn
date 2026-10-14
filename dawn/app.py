@@ -59,10 +59,13 @@ VIDEO_QUALITIES = [
     ("480p", "480"),
 ]
 AUDIO_QUALITIES = [
-    ("최고 음질 (VBR)", "0"),
-    ("320 kbps", "320"),
-    ("192 kbps", "192"),
-    ("128 kbps", "128"),
+    ("MP3 · 최고 음질 (VBR)", "mp3:0"),
+    ("MP3 · 320 kbps", "mp3:320"),
+    ("MP3 · 192 kbps", "mp3:192"),
+    ("MP3 · 128 kbps", "mp3:128"),
+    ("M4A/AAC · 최고 음질", "m4a:0"),
+    ("M4A/AAC · 256 kbps", "m4a:256"),
+    ("FLAC · 무손실", "flac:0"),
 ]
 URL_RE = re.compile(r"https?://[^\s]*\.[^\s/][^\s]*", re.IGNORECASE)  # host must contain a dot — avoids partial-URL autostart
 PLAYLIST_RE = re.compile(r"[?&]list=", re.IGNORECASE)
@@ -121,6 +124,12 @@ class Worker(QThread):
         self._cancels = {}
         self._lock = threading.Lock()
         self._last_emit = {}
+        self.max_parallel = 2  # UI spinbox adjusts live
+        self._running = 0
+        self._cv = threading.Condition()
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._pool = ThreadPoolExecutor(max_workers=8)
 
     def _emit(self, job_id: int, d: dict) -> None:
         """Throttle 'progress' to ~80ms/job; lifecycle events always pass."""
@@ -154,15 +163,30 @@ class Worker(QThread):
         while True:
             item = self.q.get()
             if item is None:
+                self._pool.shutdown(wait=True)
                 return
+            with self._cv:
+                while self._running >= self.max_parallel:
+                    self._cv.wait()
+                self._running += 1
             job_id, job = item
             ev = self._cancels.get(job_id)
-            if ev is None:
+            if ev is None or ev.is_set():
+                with self._cv:
+                    self._running -= 1
+                    self._cv.notify()
+                if ev is not None:
+                    self.progressed.emit(job_id, {"event": "cancelled"})
                 continue
-            if ev.is_set():
-                self.progressed.emit(job_id, {"event": "cancelled"})
-                continue
+            self._pool.submit(self._run_one, job_id, job, ev)
+
+    def _run_one(self, job_id: int, job: DownloadJob, ev: threading.Event) -> None:
+        try:
             run_job(job, lambda d, jid=job_id: self._emit(jid, d), ev)
+        finally:
+            with self._cv:
+                self._running -= 1
+                self._cv.notify()
             with self._lock:
                 self._cancels.pop(job_id, None)
 
@@ -287,6 +311,10 @@ class JobRow(QFrame):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
+    update_found = Signal(str, str)   # tag, asset_url
+    update_done = Signal(str)         # extracted path (restarting)
+    update_failed = Signal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
@@ -325,6 +353,12 @@ class MainWindow(QMainWindow):
         if self.clip_chk.isChecked():
             self._clip_timer.start()
 
+        # 자동 업데이트 확인 (시작 3초 뒤, 백그라운드)
+        self.update_found.connect(self._on_update_found)
+        self.update_done.connect(self._on_update_done)
+        self.update_failed.connect(self._on_update_failed)
+        QTimer.singleShot(3000, self._check_update)
+
     # ----- UI -----
 
     def _build_ui(self) -> None:
@@ -356,6 +390,26 @@ class MainWindow(QMainWindow):
         header.addLayout(title_col)
         header.addStretch(1)
         lay.addLayout(header)
+
+        # 업데이트 배너 (새 버전 있을 때만 보임)
+        self.upd_bar = QFrame()
+        self.upd_bar.setObjectName("advBox")
+        ub = QHBoxLayout(self.upd_bar)
+        ub.setContentsMargins(12, 8, 12, 8)
+        self.upd_lbl = QLabel()
+        self.upd_lbl.setWordWrap(True)
+        self.upd_btn = QPushButton("업데이트")
+        self.upd_btn.setObjectName("accentBtn")
+        self.upd_btn.clicked.connect(self._do_update)
+        self.upd_prog = QProgressBar()
+        self.upd_prog.setFixedWidth(120)
+        self.upd_prog.hide()
+        ub.addWidget(self.upd_lbl, 1)
+        ub.addWidget(self.upd_prog)
+        ub.addWidget(self.upd_btn)
+        self.upd_bar.hide()
+        lay.addWidget(self.upd_bar)
+        self._upd_url = None
 
         # URL input (paste -> auto download)
         url_row = QHBoxLayout()
@@ -486,6 +540,20 @@ class MainWindow(QMainWindow):
         )
         self.autoproxy_chk.setChecked(True)
         adv_lay.addWidget(self.autoproxy_chk)
+
+        par_row = QHBoxLayout()
+        par_row.addWidget(QLabel("동시 다운로드"))
+        from PySide6.QtWidgets import QSpinBox
+
+        self.parallel_spin = QSpinBox()
+        self.parallel_spin.setRange(1, 4)
+        self.parallel_spin.setValue(2)
+        self.parallel_spin.valueChanged.connect(
+            lambda v: setattr(self.worker, "max_parallel", v)
+        )
+        par_row.addWidget(self.parallel_spin)
+        par_row.addStretch(1)
+        adv_lay.addLayout(par_row)
         lay.addWidget(self.adv)
 
         # Queue
@@ -570,7 +638,9 @@ class MainWindow(QMainWindow):
         )
         self.folder_edit.setText(self.settings.value("outdir", default_dir))
         self._restore_combo("vquality", "best")
-        self._restore_combo("aquality", "0")
+        self._restore_combo("aquality", "mp3:0")
+        self.parallel_spin.setValue(int(self.settings.value("parallel", 2)))
+        self.worker.max_parallel = self.parallel_spin.value()
         bi = self.settings.value("cookie_browser", "")
         for i in range(self.browser_combo.count()):
             if (self.browser_combo.itemData(i) or "") == bi:
@@ -609,6 +679,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("subtitles", self.subs_chk.isChecked())
         self.settings.setValue("dedup", self.dedup_chk.isChecked())
         self.settings.setValue("clip_watch", self.clip_chk.isChecked())
+        self.settings.setValue("parallel", self.parallel_spin.value())
 
     # ----- actions -----
 
@@ -629,7 +700,7 @@ class MainWindow(QMainWindow):
             self.quality_combo.addItem(label, q)
         self.quality_combo.blockSignals(False)
         self._restore_combo("vquality" if mode == "video" else "aquality",
-                            "best" if mode == "video" else "0")
+                            "best" if mode == "video" else "mp3:0")
 
     def _toggle_adv(self, on: bool) -> None:
         self.adv.setVisible(on)
@@ -687,11 +758,13 @@ class MainWindow(QMainWindow):
             outdir = os.path.expanduser("~/Downloads/Dawn")
             self.folder_edit.setText(outdir)
             os.makedirs(outdir, exist_ok=True)
+        codec_q = self._job_quality()
         job = DownloadJob(
             url=url,
             mode=self._mode,
             outdir=outdir,
-            quality=self.quality_combo.currentData(),
+            quality=codec_q[0],
+            audio_codec=codec_q[1],
             cookies=CookieConfig(
                 browser=self.browser_combo.currentData(),
                 cookie_file=self.cookie_file_edit.text().strip() or None,
@@ -704,6 +777,16 @@ class MainWindow(QMainWindow):
             dedup=self.dedup_chk.isChecked(),
         )
         self._add_row(job)
+
+    def _job_quality(self):
+        """Combo data 'codec:q' for audio → (q, codec); video → (q, 'mp3')."""
+        data = str(self.quality_combo.currentData() or "0")
+        if self._mode == "audio" and ":" in data:
+            codec, q = data.split(":", 1)
+            return q, codec
+        if self._mode == "audio":
+            return data, "mp3"  # legacy setting without codec prefix
+        return data, "mp3"
 
     # ----- helpers for new features -----
 
@@ -937,6 +1020,77 @@ class MainWindow(QMainWindow):
         t = threading.Thread(target=work, daemon=True)
         t.start()
         self._thumb_pool.append(t)
+
+    # ----- auto update -----
+
+    def _check_update(self) -> None:
+        def work():
+            try:
+                from . import __version__, updater
+
+                res = updater.check_latest()
+                if res and updater.is_newer(res[0], __version__):
+                    self.update_found.emit(res[0], res[1])
+            except Exception:
+                pass  # update check failure is silent
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(str, str)
+    def _on_update_found(self, tag: str, url: str) -> None:
+        from . import updater
+
+        self._upd_url = url
+        self.upd_lbl.setText(
+            f"새 버전 <b>{tag}</b> 이 있습니다." + ("" if url else " (이 플랫폼용 파일 없음)")
+        )
+        self.upd_btn.setText(
+            "업데이트" if url and updater.is_frozen() else "다운로드 페이지"
+        )
+        self.upd_bar.show()
+
+    def _do_update(self) -> None:
+        from . import updater
+
+        url = self._upd_url
+        if not url or not updater.is_frozen():
+            QDesktopServices.openUrl(QUrl(updater.RELEASES_PAGE))
+            return
+        self.upd_btn.setEnabled(False)
+        self.upd_prog.setRange(0, 100)
+        self.upd_prog.show()
+
+        from PySide6.QtCore import Q_ARG, QMetaObject
+
+        def work():
+            try:
+                zip_path = updater.download(
+                    url,
+                    lambda f: QMetaObject.invokeMethod(
+                        self.upd_prog, "setValue", Qt.QueuedConnection,
+                        Q_ARG(int, int(f * 100)),
+                    ),
+                )
+                updater.apply_and_restart(zip_path)
+                self.update_done.emit(zip_path)
+            except Exception as e:
+                self.update_failed.emit(str(e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(str)
+    def _on_update_done(self, _path: str) -> None:
+        self.upd_lbl.setText("업데이트 적용 중… 앱을 재시작합니다.")
+        QTimer.singleShot(600, self.close)
+
+    @Slot(str)
+    def _on_update_failed(self, msg: str) -> None:
+        self.upd_prog.hide()
+        self.upd_btn.setEnabled(True)
+        self.upd_btn.setText("다운로드 페이지")
+        self.upd_lbl.setText(
+            f"자동 업데이트 실패 — 수동 설치해 주세요.<br><small>{msg[:120]}</small>"
+        )
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
