@@ -1,0 +1,7 @@
+yt-dlp>=2026.8.19
+yt-dlp-ejs>=0.8.0
+PySide6-Essentials>=6.8
+mutagen>=1.47
+pillow>=10.0
+imageio-ffmpeg>=0.5
+pyinstaller>=6.0
