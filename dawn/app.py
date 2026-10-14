@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .downloader import CookieConfig, DownloadJob, run_job
+from .downloader import CookieConfig, DownloadJob, detect_local_proxy, run_job
 
 APP_NAME = "Dawn"
 BROWSERS = [
@@ -440,6 +440,12 @@ class MainWindow(QMainWindow):
         self.geo_chk = QCheckBox("지역 제한 우회 (yt-dlp geo-bypass)")
         adv_lay.addWidget(self.geo_chk)
         self.adv.hide()
+
+        self.autoproxy_chk = QCheckBox(
+            "로컬 우회툴 자동 연결 (GoodbyeDPI·Psiphon·Clash 등 켜져 있으면 자동 감지)"
+        )
+        self.autoproxy_chk.setChecked(True)
+        adv_lay.addWidget(self.autoproxy_chk)
         lay.addWidget(self.adv)
 
         # Queue
@@ -533,6 +539,9 @@ class MainWindow(QMainWindow):
         self.playlist_chk.setChecked(self.settings.value("playlist", False, type=bool))
         self.proxy_edit.setText(self.settings.value("proxy", ""))
         self.geo_chk.setChecked(self.settings.value("geo_bypass", False, type=bool))
+        self.autoproxy_chk.setChecked(
+            self.settings.value("autoproxy", True, type=bool)
+        )
         if self.settings.value("adv_open", False, type=bool):
             self.adv_btn.setChecked(True)
 
@@ -554,6 +563,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("adv_open", self.adv_btn.isChecked())
         self.settings.setValue("proxy", self.proxy_edit.text())
         self.settings.setValue("geo_bypass", self.geo_chk.isChecked())
+        self.settings.setValue("autoproxy", self.autoproxy_chk.isChecked())
 
     # ----- actions -----
 
@@ -642,11 +652,24 @@ class MainWindow(QMainWindow):
                 cookie_file=self.cookie_file_edit.text().strip() or None,
             ),
             playlist=self._resolve_playlist(url, playlist_cache),
-            proxy=self.proxy_edit.text().strip() or None,
+            proxy=self._effective_proxy(),
             geo_bypass=self.geo_chk.isChecked(),
         )
         self._add_row(job)
         self._update_summary()
+
+    def _effective_proxy(self) -> "str | None":
+        """Explicit proxy wins; otherwise auto-detect a running local
+        circumvention tool when enabled."""
+        manual = self.proxy_edit.text().strip()
+        if manual:
+            return manual
+        if not self.autoproxy_chk.isChecked():
+            return None
+        found = detect_local_proxy()
+        if found:
+            self.proxy_edit.setPlaceholderText(f"자동 감지됨: {found}")
+        return found
 
     def _resolve_playlist(self, url: str, cache: dict | None = None) -> bool:
         if not is_playlist_url(url):
@@ -781,6 +804,13 @@ class MainWindow(QMainWindow):
             row.set_state("error", (d.get("message") or "")[:160])
             row.setToolTip(d.get("message") or "")
             self._update_summary()
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        if hasattr(self, "empty_hint") and self.empty_hint.isVisible():
+            self.empty_hint.resize(self.list.width(), 60)
+            self.empty_hint.move(0, int(self.list.height() * 0.3))
+
     # ----- lifecycle -----
 
     def closeEvent(self, e) -> None:

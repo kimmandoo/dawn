@@ -127,6 +127,37 @@ def _js_runtimes() -> dict:
     return {"deno": {}}
 
 
+def detect_local_proxy(timeout: float = 0.4) -> Optional[str]:
+    """Probe common local proxy ports (GoodbyeDPI/Psiphon/Clash-style
+    circumvention tools) and return a working CONNECT proxy URL, if any."""
+    import socket
+    from concurrent.futures import ThreadPoolExecutor
+
+    candidates = [
+        1080, 1081, 2080, 2081, 4780,       # SOCKS/HTTP circumvention tools
+        7890, 7891, 7897,                   # Clash / Clash Verge
+        8080, 8118, 8888, 8889, 8880,       # generic HTTP / Privoxy
+    ]
+
+    def probe(port: int) -> Optional[str]:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+                s.settimeout(2.0)
+                s.sendall(b"CONNECT www.youtube.com:443 HTTP/1.1\r\n\r\n")
+                resp = s.recv(128)
+                if b"200" in resp.split(b"\r\n", 1)[0]:
+                    return f"http://127.0.0.1:{port}"
+        except OSError:
+            pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=len(candidates)) as ex:
+        for res in ex.map(probe, candidates):
+            if res:
+                return res
+    return None
+
+
 def _ydl_opts(job: DownloadJob) -> dict:
     opts = {
         "outtmpl": os.path.join(
