@@ -19,7 +19,7 @@ a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=_extra_bins,
-    datas=collect_data_files("yt_dlp_ejs") + collect_data_files("imageio_ffmpeg"),
+    datas=collect_data_files("yt_dlp_ejs") + collect_data_files("imageio_ffmpeg") + [("dawn/icon.png", "dawn")],
     hiddenimports=["imageio_ffmpeg", "yt_dlp_ejs"],
     noarchive=False,
 )

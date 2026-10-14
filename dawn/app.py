@@ -82,6 +82,13 @@ STATUS_COLOR = {
     "cancelled": "#999",
 }
 
+def _res(name: str) -> str:
+    """Asset path that works in dev (dawn/) and inside the PyInstaller bundle."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return os.path.join(meipass, "dawn", name)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
 
 def human_bytes(n) -> str:
     if not n:
@@ -113,6 +120,18 @@ class Worker(QThread):
         self.q: "queue.Queue" = queue.Queue()
         self._cancels = {}
         self._lock = threading.Lock()
+        self._last_emit = {}
+
+    def _emit(self, job_id: int, d: dict) -> None:
+        """Throttle 'progress' to ~80ms/job; lifecycle events always pass."""
+        import time
+
+        if d.get("event") == "progress" and d.get("phase") != "postprocess":
+            now = time.monotonic()
+            if (d.get("fraction") or 0) < 1.0 and now - self._last_emit.get(job_id, 0) < 0.08:
+                return
+            self._last_emit[job_id] = now
+        self.progressed.emit(job_id, d)
 
     def add(self, job_id: int, job: DownloadJob) -> None:
         with self._lock:
@@ -143,7 +162,7 @@ class Worker(QThread):
             if ev.is_set():
                 self.progressed.emit(job_id, {"event": "cancelled"})
                 continue
-            run_job(job, lambda d, jid=job_id: self.progressed.emit(jid, d), ev)
+            run_job(job, lambda d, jid=job_id: self._emit(jid, d), ev)
             with self._lock:
                 self._cancels.pop(job_id, None)
 
@@ -176,12 +195,17 @@ class JobRow(QFrame):
         self.retry_btn.setToolTip("다시 시도")
         self.retry_btn.clicked.connect(self.retryRequested)
         self.retry_btn.hide()
+        self.folder_btn = QPushButton("📂")
+        self.folder_btn.setFixedSize(24, 24)
+        self.folder_btn.setToolTip("저장 폴더 열기")
+        self.folder_btn.hide()
 
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         top.addWidget(icon)
         top.addWidget(self.title, 1)
         top.addWidget(self.retry_btn)
+        top.addWidget(self.folder_btn)
         top.addWidget(self.cancel_btn)
 
         self.bar = QProgressBar()
@@ -200,6 +224,12 @@ class JobRow(QFrame):
         lay.addWidget(self.bar)
         lay.addWidget(self.status_lbl)
 
+        self.folder_btn.clicked.connect(self._open_folder)
+
+    def _open_folder(self) -> None:
+        if self.outdir:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.outdir))
+
     def set_state(self, status: str, detail: str = "") -> None:
         self.status = status
         text = STATUS_TEXT.get(status, status)
@@ -216,6 +246,7 @@ class JobRow(QFrame):
         if status in ("done", "error", "cancelled"):
             self.cancel_btn.hide()
             self.retry_btn.setVisible(status == "error")
+            self.folder_btn.setVisible(status == "done")
             if status == "done":
                 self.bar.setRange(0, 100)
                 self.bar.setValue(100)
@@ -223,6 +254,7 @@ class JobRow(QFrame):
     def reset_for_retry(self) -> None:
         self.status = "wait"
         self.retry_btn.hide()
+        self.folder_btn.hide()
         self.cancel_btn.show()
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
@@ -282,12 +314,29 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(16, 16, 16, 12)
         lay.setSpacing(10)
 
-        title = QLabel("⬇ Dawn")
+        from PySide6.QtGui import QPixmap
+
+        header = QHBoxLayout()
+        chick = QLabel()
+        icon_png = _res("icon.png")
+        if os.path.exists(icon_png):
+            pm = QPixmap(icon_png).scaledToHeight(
+                52, Qt.SmoothTransformation
+            )
+            pm.setDevicePixelRatio(2)
+            chick.setPixmap(pm)
+        header.addWidget(chick)
+        title_col = QVBoxLayout()
+        title_col.setSpacing(0)
+        title = QLabel("Dawn")
         title.setObjectName("appTitle")
-        sub = QLabel("링크를 붙여넣으면 바로 다운로드됩니다")
+        sub = QLabel("링크를 붙여넣으면 바로 다운로드 🐣")
         sub.setObjectName("appSub")
-        lay.addWidget(title)
-        lay.addWidget(sub)
+        title_col.addWidget(title)
+        title_col.addWidget(sub)
+        header.addLayout(title_col)
+        header.addStretch(1)
+        lay.addLayout(header)
 
         # URL input (paste -> auto download)
         url_row = QHBoxLayout()
@@ -397,6 +446,7 @@ class MainWindow(QMainWindow):
         self.empty_hint.setObjectName("appSub")
         self.empty_hint.setAlignment(Qt.AlignCenter)
         self.empty_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.empty_hint.setStyleSheet("color: #C9B88A; font-size: 14px;")
         self.empty_hint.resize(self.list.width(), 60)
 
         hint = QLabel("목록 항목 더블클릭 → 저장 폴더 열기")
@@ -407,18 +457,45 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         self.setStyleSheet(
             """
-            #appTitle { font-size: 24px; font-weight: 700; }
-            #appSub, #hint, #statusLbl { color: #888; font-size: 12px; }
+            QMainWindow, QWidget { background: #FFF6E3; color: #3E2723; }
+            #appTitle { font-size: 26px; font-weight: 800; color: #3E2723; }
+            #appSub, #hint, #statusLbl { color: #8D6E63; font-size: 12px; }
+            QLineEdit, QComboBox {
+                background: #FFFBEF; border: 2px solid #DCCB9E; border-radius: 8px;
+                padding: 7px 10px; selection-background-color: #FFD159;
+            }
+            QLineEdit:focus, QComboBox:focus { border-color: #FF8F3D; }
+            QComboBox::drop-down { border: none; width: 24px; }
+            QPushButton {
+                background: #FFFBEF; border: 2px solid #DCCB9E; border-radius: 8px;
+                padding: 7px 14px; color: #3E2723;
+            }
+            QPushButton:hover { background: #FFF0C8; border-color: #FF8F3D; }
+            QPushButton:pressed { background: #FFE1A8; }
             QPushButton[checkable="true"]:checked {
-                border: 2px solid #e2554f; font-weight: 600; }
-            #jobRow { border: 1px solid rgba(128,128,128,0.35); border-radius: 8px; }
-            #advBox { border: 1px dashed rgba(128,128,128,0.5); border-radius: 8px; }
-            #advBtn { text-align: left; border: none; color: #888; }
-            QProgressBar { border: none; border-radius: 3px;
-                           background: rgba(128,128,128,0.25); }
-            QProgressBar::chunk { border-radius: 3px; background: #e2554f; }
+                background: #FFD159; border: 2px solid #3E2723; font-weight: 700;
+            }
+            #jobRow {
+                background: #FFFBEF; border: 2px solid #DCCB9E; border-radius: 10px;
+            }
+            #advBox { background: #FFFBEF; border: 2px dashed #DCCB9E; border-radius: 10px; }
+            #advBtn { text-align: left; border: none; color: #8D6E63; padding: 2px 4px; }
+            #advBtn:hover { color: #3E2723; }
+            #ghostBtn { border: none; color: #8D6E63; }
+            #ghostBtn:hover { color: #3E2723; text-decoration: underline; }
+            QListWidget {
+                background: #FFF9EA; border: 2px solid #DCCB9E; border-radius: 10px;
+            }
+            QListWidget::item { border: none; }
+            QProgressBar {
+                border: none; border-radius: 5px; background: #EFE3C3;
+            }
+            QProgressBar::chunk { border-radius: 5px; background: #FF8F3D; }
+            QToolTip { background: #3E2723; color: #FFF6E3; border: none; padding: 6px; }
             """
         )
+
+        self.setWindowIcon(QIcon(_res("icon.png")))
         self._set_mode(self.settings.value("mode", "video"))
 
     # ----- settings -----
@@ -695,7 +772,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("Dawn")
-    icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
+    icon_path = _res("icon.png")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
     w = MainWindow()
