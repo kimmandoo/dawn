@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec: Windows -> single Dawn.exe, macOS -> Dawn.app.
+"""PyInstaller spec: Windows -> Dawn.exe + goodbyedpi/, macOS -> Dawn.app.
 
 Build:
     python scripts/fetch_bypass.py
@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import platform
 import sys
-from shutil import which
+from shutil import copy2, which
 
 from PyInstaller.utils.hooks import collect_data_files
 
@@ -57,7 +57,14 @@ for _relative, _target, _binary in _engine_files:
             f"Bypass engine is not executable: {_source}\n"
             "Run: python scripts/fetch_bypass.py"
         )
-    (_extra_bins if _binary else _extra_data).append((str(_source), _target))
+    if sys.platform == "win32":
+        # Kernel drivers can remain loaded after the helper exits. Never put
+        # them in a onefile temporary directory that the bootloader must delete.
+        _destination = Path(DISTPATH) / _target
+        _destination.mkdir(parents=True, exist_ok=True)
+        copy2(_source, _destination / _source.name)
+    else:
+        (_extra_bins if _binary else _extra_data).append((str(_source), _target))
 
 a = Analysis(
     ["main.py"],
@@ -113,6 +120,6 @@ else:
         icon="dawn/icon.icns",
         info_plist={
             "NSHighResolutionCapable": True,
-            "CFBundleShortVersionString": "0.3.2",
+            "CFBundleShortVersionString": "0.3.3",
         },
     )

@@ -61,7 +61,7 @@ jobs:
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path dist\Dawn.exe -DestinationPath ${{ matrix.asset }}
+        run: Compress-Archive -Path dist\Dawn.exe,dist\goodbyedpi -DestinationPath ${{ matrix.asset }}
 
       - name: Package artifact (macOS)
         if: runner.os == 'macOS'

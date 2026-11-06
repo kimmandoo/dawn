@@ -25,6 +25,8 @@ Dawn은 [yt-dlp](https://github.com/yt-dlp/yt-dlp)와 [PySide6](https://doc.qt.i
 | Windows x64 | [Dawn-windows-x64.zip](https://github.com/kimmandoo/dawn/releases/latest/download/Dawn-windows-x64.zip) | 압축 해제 후 `Dawn.exe` |
 | macOS Apple Silicon · ARM64 | [Dawn-macos-arm64.zip](https://github.com/kimmandoo/dawn/releases/latest/download/Dawn-macos-arm64.zip) | 압축 해제 후 `Dawn.app` |
 
+Windows에서는 `Dawn.exe`와 `goodbyedpi` 폴더를 같은 위치에 두세요. 드라이버는 일회성 임시 폴더가 아닌 이 고정 경로에서 실행됩니다. 실행 파일만 따로 옮기면 동봉된 DPI 우회 엔진을 찾지 못할 수 있습니다.
+
 - 배포 앱은 서명되지 않았습니다. macOS에서 실행이 차단되면 시스템의 **개인정보 보호 및 보안** 안내를 확인하세요. 보안 기능을 전체적으로 해제하지 마세요.
 - macOS Intel과 Linux용 공식 배포 파일은 제공하지 않습니다. 소스 실행 및 해당 환경의 우회 엔진 지원은 공식 배포 지원 범위와 별개입니다.
 
@@ -152,7 +154,7 @@ macOS에서는 다음을 실행합니다. Windows에서는 `.venv/bin/python`을
 ```powershell
 .venv\Scripts\python scripts\fetch_bypass.py
 .venv\Scripts\python -m PyInstaller dawn.spec --noconfirm
-# dist\Dawn.exe
+# dist\Dawn.exe + dist\goodbyedpi\
 ```
 
 우회 엔진은 빌드 준비 단계에서 공식 릴리스의 SHA256을 검증하고 라이선스와 함께 묶습니다. 앱 실행 중에는 자동으로 내려받지 않습니다.

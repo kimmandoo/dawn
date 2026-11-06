@@ -59,7 +59,10 @@ def find_bypass_engine() -> str | None:
 
     candidates: list[Path] = []
     bundled = getattr(sys, "_MEIPASS", None)
-    if bundled:
+    if sys.platform == "win32" and getattr(sys, "frozen", False):
+        # WinDivert must outlive the onefile extraction directory safely.
+        candidates.append(Path(sys.executable).resolve().parent / relative)
+    elif bundled:
         candidates.append(Path(bundled) / relative)
     vendor = Path(__file__).resolve().parent.parent / "vendor"
     candidates.append(vendor / relative if sys.platform == "win32"
