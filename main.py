@@ -4,12 +4,13 @@ import sys
 
 def _selftest(url: str, dpi_bypass: bool = False) -> int:
     """Headless download verification for CI / packaged builds."""
+    import faulthandler
     import tempfile
     import threading
 
     for stream in (sys.stdout, sys.stderr):
         if stream is not None:
-            stream.reconfigure(encoding="utf-8")
+            stream.reconfigure(encoding="utf-8", line_buffering=True)
 
     from dawn.downloader import DownloadJob, run_job
 
@@ -22,7 +23,13 @@ def _selftest(url: str, dpi_bypass: bool = False) -> int:
         if d.get("event") != "progress":
             print("[selftest]", {key: value for key, value in d.items() if key != "thumb_data"})
 
-    run_job(job, cb, threading.Event())
+    if sys.stderr is not None:
+        faulthandler.dump_traceback_later(45, repeat=True)
+    try:
+        run_job(job, cb, threading.Event())
+    finally:
+        if sys.stderr is not None:
+            faulthandler.cancel_dump_traceback_later()
     ok = last.get("event") == "done"
     files = os.listdir(outdir)
     mp3s = [f for f in files if f.endswith(".mp3")]

@@ -15,9 +15,10 @@ import wave
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         if stream is not None:
-            stream.reconfigure(encoding="utf-8")
+            stream.reconfigure(encoding="utf-8", line_buffering=True)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dpi-bypass", action="store_true")
+    parser.add_argument("--source", action="store_true", help="Run main.py instead of a built executable")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     if sys.platform == "win32":
@@ -48,17 +49,15 @@ def main() -> int:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            command = [str(executable), "--selftest", f"http://127.0.0.1:{server.server_port}/sample.wav"]
+            command = [sys.executable, str(root / "main.py")] if args.source else [str(executable)]
+            command += ["--selftest", f"http://127.0.0.1:{server.server_port}/sample.wav"]
             if args.dpi_bypass:
                 command.append("--dpi-bypass")
-            result = subprocess.run(command, timeout=120, capture_output=True, encoding="utf-8")
-            print(result.stdout)
-            if result.stderr:
-                print(result.stderr, file=sys.stderr)
+            result = subprocess.run(command, timeout=120, stdout=sys.stdout, stderr=sys.stderr)
             if result.returncode:
-                print(f"Packaged download failed with exit code {result.returncode}", file=sys.stderr)
+                print(f"Download failed with exit code {result.returncode}", file=sys.stderr)
                 return 1
-            print("Packaged audio download/conversion passed" + (" with DPI bypass" if args.dpi_bypass else ""))
+            print(("Source" if args.source else "Packaged") + " audio download/conversion passed" + (" with DPI bypass" if args.dpi_bypass else ""))
             return 0
         finally:
             server.shutdown()

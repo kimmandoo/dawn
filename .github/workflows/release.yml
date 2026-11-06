@@ -39,6 +39,9 @@ jobs:
       - name: Verify format coexistence and thumbnail reuse
         run: python -m unittest discover -s tests -v
 
+      - name: Verify native DPI runtime before packaging
+        run: python scripts/smoke_packaged.py --source --dpi-bypass
+
       - name: Build
         run: python -m PyInstaller dawn.spec --noconfirm --clean
 
