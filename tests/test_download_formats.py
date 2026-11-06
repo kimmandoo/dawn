@@ -5,8 +5,10 @@ from dataclasses import replace
 import functools
 import hashlib
 import http.server
+import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -121,6 +123,15 @@ class DownloadFormatsTest(unittest.TestCase):
         self.assertEqual(self.requests["/cover.jpg"], 1)
         audio = MP3(next(self.output.glob("*.mp3")))
         self.assertEqual(audio.tags.getall("APIC")[0].mime, "image/jpeg")
+
+    def test_cli_download_succeeds_with_legacy_console_encoding(self):
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parents[1] / "main.py"),
+             "--selftest", self.job.url],
+            env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+            capture_output=True, encoding="utf-8", timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

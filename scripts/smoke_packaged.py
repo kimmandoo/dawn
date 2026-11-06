@@ -13,6 +13,9 @@ import wave
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None:
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dpi-bypass", action="store_true")
     args = parser.parse_args()
@@ -48,7 +51,7 @@ def main() -> int:
             command = [str(executable), "--selftest", f"http://127.0.0.1:{server.server_port}/sample.wav"]
             if args.dpi_bypass:
                 command.append("--dpi-bypass")
-            result = subprocess.run(command, timeout=120, capture_output=True, text=True)
+            result = subprocess.run(command, timeout=120, capture_output=True, encoding="utf-8")
             print(result.stdout)
             if result.stderr:
                 print(result.stderr, file=sys.stderr)

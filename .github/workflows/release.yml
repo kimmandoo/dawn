@@ -15,7 +15,7 @@ jobs:
       matrix:
         include:
           - { os: windows-latest, asset: Dawn-windows-x64.zip }
-          - { os: macos-14, asset: Dawn-macos-arm64.zip }      # Apple Silicon
+          - { os: macos-15, asset: Dawn-macos-arm64.zip }      # Apple Silicon
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

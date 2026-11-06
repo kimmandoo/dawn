@@ -7,6 +7,10 @@ def _selftest(url: str, dpi_bypass: bool = False) -> int:
     import tempfile
     import threading
 
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None:
+            stream.reconfigure(encoding="utf-8")
+
     from dawn.downloader import DownloadJob, run_job
 
     outdir = tempfile.mkdtemp(prefix="dawn-selftest-")

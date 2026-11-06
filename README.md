@@ -100,6 +100,8 @@
 
 이 검사는 로컬 미디어를 사용하며 Windows에서는 관리자 권한이 필요합니다. 릴리스 CI에서도 실행합니다.
 
+릴리스 빌드는 지원 중인 macOS 15 ARM64 실행 환경을 사용합니다. 패키지 자체 검사의 입출력은 UTF-8로 통일해 Windows의 기본 콘솔 코드 페이지에서도 한글 로그 때문에 다운로드가 실패하지 않도록 합니다.
+
 캐릭터 원본은 `dawn/mascot.svg`입니다. 수정 후 `.venv/bin/python scripts/render_icons.py`를 실행하면 화면용 PNG와 Windows ICO·macOS ICNS를 함께 다시 생성합니다. 앱에 반영하려면 이후 다시 빌드하세요.
 
 ## 구조
