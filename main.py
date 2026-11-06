@@ -4,7 +4,6 @@ import sys
 
 def _selftest(url: str, dpi_bypass: bool = False) -> int:
     """Headless download verification for CI / packaged builds."""
-    import faulthandler
     import tempfile
     import threading
 
@@ -23,13 +22,7 @@ def _selftest(url: str, dpi_bypass: bool = False) -> int:
         if d.get("event") != "progress":
             print("[selftest]", {key: value for key, value in d.items() if key != "thumb_data"})
 
-    if sys.stderr is not None:
-        faulthandler.dump_traceback_later(45, repeat=True)
-    try:
-        run_job(job, cb, threading.Event())
-    finally:
-        if sys.stderr is not None:
-            faulthandler.cancel_dump_traceback_later()
+    run_job(job, cb, threading.Event())
     ok = last.get("event") == "done"
     files = os.listdir(outdir)
     mp3s = [f for f in files if f.endswith(".mp3")]

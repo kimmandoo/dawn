@@ -113,6 +113,6 @@ else:
         icon="dawn/icon.icns",
         info_plist={
             "NSHighResolutionCapable": True,
-            "CFBundleShortVersionString": "0.3.1",
+            "CFBundleShortVersionString": "0.3.2",
         },
     )

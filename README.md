@@ -163,6 +163,8 @@ macOS에서는 다음을 실행합니다. Windows에서는 `.venv/bin/python`을
 .venv/bin/python scripts/smoke_packaged.py --dpi-bypass
 ```
 
+`--source`를 추가하면 빌드된 실행 파일 대신 현재 소스로 같은 검사를 수행합니다. Windows 배포 앱 검사는 소스에서 우회 엔진을 먼저 실행하기 전에 수행합니다.
+
 [릴리스 워크플로](.github/workflows/release.yml)는 Windows x64와 macOS 15 ARM64에서 빌드하고 필수 검사를 통과한 패키지를 배포합니다. 외부 사이트 검사는 네트워크·사이트 정책의 영향을 받으므로 로컬 패키지 검사와 구분합니다.
 
 ### 캐릭터와 아이콘
