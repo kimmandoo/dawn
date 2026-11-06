@@ -1,4 +1,4 @@
-"""Dawn — 초간단 다운로더 UI. 링크를 붙여넣으면 바로 받아진다."""
+"""Dawn — 링크를 확인하고 간편하게 저장하는 다운로더."""
 from __future__ import annotations
 
 import os
@@ -8,7 +8,9 @@ import sys
 import threading
 
 from PySide6.QtCore import (
+    QRectF,
     QSettings,
+    QSize,
     QStandardPaths,
     Qt,
     QThread,
@@ -17,11 +19,12 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QDesktopServices, QIcon
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -34,11 +37,17 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QScrollArea,
+    QStyle,
+    QStyleOptionButton,
+    QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from .downloader import CookieConfig, DownloadJob, detect_local_proxy, run_job
+from .bypass import find_bypass_engine, is_admin, shutdown_bypass
+from .downloader import CookieConfig, DownloadJob, run_job
 
 APP_NAME = "Dawn"
 BROWSERS = [
@@ -75,14 +84,14 @@ STATUS_TEXT = {
     "extract": "정보 가져오는 중…",
     "downloading": "다운로드 중",
     "postprocess": "변환/태그 중…",
-    "done": "완료 ✓",
+    "done": "저장 완료",
     "error": "실패",
     "cancelled": "취소됨",
 }
 STATUS_COLOR = {
-    "done": "#4caf50",
-    "error": "#e2554f",
-    "cancelled": "#999",
+    "done": "#28734D",
+    "error": "#B63832",
+    "cancelled": "#726D66",
 }
 
 def _res(name: str) -> str:
@@ -111,12 +120,49 @@ def is_playlist_url(url: str) -> bool:
     return bool(PLAYLIST_RE.search(url))
 
 
+class Dropdown(QComboBox):
+    """Draw a visible disclosure arrow independently of the native theme."""
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor("#736F66"), 1.5))
+        x, y = self.width() - 16, self.height() // 2
+        painter.drawLine(x - 4, y - 2, x, y + 2)
+        painter.drawLine(x, y + 2, x + 4, y - 2)
+
+
+class OptionCheckBox(QCheckBox):
+    """Keep native checkbox behavior with a consistent, high-contrast indicator."""
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        rect = self.style().subElementRect(QStyle.SE_CheckBoxIndicator, option, self)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        checked = self.isChecked()
+        painter.setPen(QPen(QColor("#B84E23" if checked or self.hasFocus() else "#C8C2B7"), 1.5))
+        painter.setBrush(QColor("#B84E23" if checked else "#FFFFFF"))
+        painter.drawRoundedRect(QRectF(rect).adjusted(1, 1, -1, -1), 5, 5)
+        if checked:
+            painter.setPen(QPen(QColor("#FFFFFF"), 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            x, y = rect.x(), rect.y()
+            painter.drawLine(x + 5, y + 10, x + 8, y + 13)
+            painter.drawLine(x + 8, y + 13, x + 14, y + 6)
+
+
 class ElidedLabel(QLabel):
     """QLabel that right-elides long text instead of clipping mid-glyph."""
 
     def __init__(self, text="", parent=None):
         self._full = text
         super().__init__(text, parent)
+        self.setTextFormat(Qt.PlainText)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
     def setText(self, t) -> None:
         self._full = t
@@ -231,23 +277,24 @@ class JobRow(QFrame):
         self.url = url
         self.outdir = ""
 
-        self.icon = QLabel("🎬" if mode == "video" else "🎵")
-        self.icon.setFixedSize(48, 30)
+        self.icon = QLabel("MP4" if mode == "video" else "음원")
+        self.icon.setObjectName("mediaBadge")
+        self.icon.setFixedSize(48, 36)
         self.icon.setAlignment(Qt.AlignCenter)
         self.title = ElidedLabel(url)
         self.title.setToolTip(url)
-        self.title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self.cancel_btn = QPushButton("✕")
-        self.cancel_btn.setFixedSize(24, 24)
+        self.title.setObjectName("jobTitle")
+        self.cancel_btn = QPushButton("취소")
+        self.cancel_btn.setMinimumHeight(32)
         self.cancel_btn.setToolTip("취소")
         self.cancel_btn.clicked.connect(self.cancelRequested)
-        self.retry_btn = QPushButton("↻")
-        self.retry_btn.setFixedSize(24, 24)
-        self.retry_btn.setToolTip("다시 시도")
+        self.retry_btn = QPushButton("다시 시도")
+        self.retry_btn.setMinimumHeight(32)
+        self.retry_btn.setToolTip("같은 설정으로 다시 다운로드")
         self.retry_btn.clicked.connect(self.retryRequested)
         self.retry_btn.hide()
-        self.folder_btn = QPushButton("폴더")
-        self.folder_btn.setFixedSize(44, 24)
+        self.folder_btn = QPushButton("폴더 열기")
+        self.folder_btn.setMinimumHeight(32)
         self.folder_btn.setToolTip("저장 폴더 열기")
         self.folder_btn.hide()
 
@@ -265,12 +312,12 @@ class JobRow(QFrame):
         self.bar.setTextVisible(False)
         self.bar.setFixedHeight(6)
 
-        self.status_lbl = QLabel(STATUS_TEXT["wait"])
+        self.status_lbl = ElidedLabel(STATUS_TEXT["wait"])
         self.status_lbl.setObjectName("statusLbl")
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 6, 8, 6)
-        lay.setSpacing(4)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(10)
         lay.addLayout(top)
         lay.addWidget(self.bar)
         lay.addWidget(self.status_lbl)
@@ -287,8 +334,10 @@ class JobRow(QFrame):
         if detail:
             text = f"{text} — {detail}"
         self.status_lbl.setText(text)
+        self.status_lbl.setToolTip(text)
         color = STATUS_COLOR.get(status)
         self.status_lbl.setStyleSheet(f"color: {color};" if color else "")
+        self.bar.setStyleSheet(f"QProgressBar::chunk {{ background: {color}; }}" if color else "")
         if status in ("extract", "postprocess"):
             self.bar.setRange(0, 0)  # indeterminate while preparing/converting
         elif status == "wait":
@@ -296,20 +345,24 @@ class JobRow(QFrame):
             self.bar.setValue(0)
         if status in ("done", "error", "cancelled"):
             self.cancel_btn.hide()
-            self.retry_btn.setVisible(status == "error")
+            self.retry_btn.setVisible(status in ("error", "cancelled"))
             self.folder_btn.setVisible(status == "done")
-            if status == "done":
-                self.bar.setRange(0, 100)
-                self.bar.setValue(100)
+            self.bar.setRange(0, 100)
+            self.bar.setValue(100 if status == "done" else 0)
 
     def reset_for_retry(self) -> None:
         self.status = "wait"
         self.retry_btn.hide()
         self.folder_btn.hide()
         self.cancel_btn.show()
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.setText("취소")
+        self.setToolTip("")
+        self.status_lbl.setToolTip("")
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
         self.status_lbl.setStyleSheet("")
+        self.bar.setStyleSheet("")
         self.status_lbl.setText(STATUS_TEXT["wait"])
 
     def set_progress(self, fraction, speed=None, eta=None) -> None:
@@ -340,15 +393,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(660, 780)
-        self.setMinimumSize(560, 600)
+        self.resize(760, 800)
+        self.setMinimumSize(620, 700)
         self.setAcceptDrops(True)
         self.settings = QSettings("Dawn", "Dawn")
         self._next_id = 1
         self._rows = {}  # id -> (QListWidgetItem, JobRow)
         self._mode = "video"
         self._last_clip = ""
-        self._thumb_pool = []
         from PySide6.QtWidgets import QSystemTrayIcon
 
         self._tray = QSystemTrayIcon(self)
@@ -365,6 +417,10 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
         self._build_ui()
+        self._load_settings()
+        self._update_summary()
+        self._update_options_hint()
+        self.url_edit.setFocus()
 
         # clipboard watcher (opt-in via adv checkbox)
         self._clip_timer = QTimer(self)
@@ -381,286 +437,410 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         root = QWidget()
+        root.setObjectName("window")
         lay = QVBoxLayout(root)
-        lay.setContentsMargins(16, 16, 16, 12)
-        lay.setSpacing(10)
-
-        from PySide6.QtGui import QPixmap
+        lay.setContentsMargins(28, 24, 28, 20)
+        lay.setSpacing(16)
 
         header = QHBoxLayout()
-        chick = QLabel()
-        icon_png = _res("icon.png")
-        if os.path.exists(icon_png):
-            pm = QPixmap(icon_png).scaledToHeight(
-                52, Qt.SmoothTransformation
-            )
-            pm.setDevicePixelRatio(2)
-            chick.setPixmap(pm)
-        header.addWidget(chick)
+        header.setSpacing(12)
+        brand = QLabel()
+        brand.setObjectName("brandMark")
+        brand.setFixedSize(56, 56)
+        brand.setAlignment(Qt.AlignCenter)
+        logo = QPixmap(_res("mascot.png")).scaled(112, 112, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        logo.setDevicePixelRatio(2)
+        brand.setPixmap(logo)
+        header.addWidget(brand)
         title_col = QVBoxLayout()
-        title_col.setSpacing(0)
+        title_col.setSpacing(2)
         title = QLabel("Dawn")
         title.setObjectName("appTitle")
-        sub = QLabel("링크를 붙여넣으면 바로 다운로드 🐣")
+        sub = QLabel("좋아하는 콘텐츠를, 간편하게.")
         sub.setObjectName("appSub")
         title_col.addWidget(title)
         title_col.addWidget(sub)
         header.addLayout(title_col)
-        header.addStretch(1)
+        header.addStretch()
+        self.adv_btn = QPushButton("설정")
+        self.adv_btn.setToolTip("다운로드 옵션 · 로그인 · 네트워크")
+        self.adv_btn.clicked.connect(self._show_settings)
+        header.addWidget(self.adv_btn)
         lay.addLayout(header)
 
-
-        # URL input (paste -> auto download)
+        card = QFrame()
+        card.setObjectName("downloadCard")
+        composer = QVBoxLayout(card)
+        composer.setContentsMargins(20, 18, 20, 18)
+        composer.setSpacing(12)
+        heading = QLabel("무엇을 저장할까요?")
+        heading.setObjectName("sectionTitle")
+        composer.addWidget(heading)
         url_row = QHBoxLayout()
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("🔗 링크 붙여넣기 (자동 시작)")
+        self.url_edit.setObjectName("urlInput")
+        self.url_edit.setPlaceholderText("https:// 링크를 붙여넣으세요")
+        self.url_edit.setAccessibleName("다운로드할 링크")
+        self.url_edit.setMinimumHeight(46)
         self.url_edit.setClearButtonEnabled(True)
+        self.url_edit.setAcceptDrops(False)
         self.url_edit.textChanged.connect(self._on_url_changed)
         self.url_edit.returnPressed.connect(self.enqueue)
-        paste_btn = QPushButton("📋 붙여넣기")
+        paste_btn = QPushButton("붙여넣기")
+        paste_btn.setObjectName("pasteBtn")
+        paste_btn.setMinimumHeight(46)
         paste_btn.clicked.connect(self._paste)
         url_row.addWidget(self.url_edit, 1)
         url_row.addWidget(paste_btn)
-        lay.addLayout(url_row)
+        composer.addLayout(url_row)
 
-        # Mode toggle
         mode_row = QHBoxLayout()
-        self.btn_video = QPushButton("🎬  영상 + 음원 (MP4)")
-        self.btn_audio = QPushButton("🎵  음원만 (MP3·M4A·FLAC)")
-        for b in (self.btn_video, self.btn_audio):
-            b.setCheckable(True)
-            b.setMinimumHeight(44)
-            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        mode_row.setSpacing(8)
+        segments = QFrame()
+        segments.setObjectName("modeSwitch")
+        segments.setMinimumHeight(48)
+        segment_layout = QHBoxLayout(segments)
+        segment_layout.setContentsMargins(4, 4, 4, 4)
+        segment_layout.setSpacing(4)
+        self.btn_video = QPushButton("영상 · MP4")
+        self.btn_audio = QPushButton("음원")
+        self.btn_video.setToolTip("소리가 포함된 MP4 영상")
+        self.btn_audio.setToolTip("MP3 · M4A · FLAC 음원")
+        for button in (self.btn_video, self.btn_audio):
+            button.setObjectName("modeBtn")
+            button.setCheckable(True)
+            button.setMinimumSize(76, 40)
+            segment_layout.addWidget(button)
         self.btn_video.clicked.connect(lambda: self._set_mode("video"))
         self.btn_audio.clicked.connect(lambda: self._set_mode("audio"))
-        mode_row.addWidget(self.btn_video)
-        mode_row.addWidget(self.btn_audio)
-        lay.addLayout(mode_row)
-
-        # Quality + folder
-        opt_row = QHBoxLayout()
+        mode_row.addWidget(segments)
+        mode_row.addStretch()
         self.quality_lbl = QLabel("화질")
-        self.quality_combo = QComboBox()
+        self.quality_lbl.setObjectName("hint")
+        self.quality_combo = Dropdown()
+        self.quality_combo.setAccessibleName("저장 화질 또는 음질")
+        self.quality_combo.setMinimumWidth(200)
+        self.quality_combo.setMinimumHeight(44)
+        self.quality_lbl.setBuddy(self.quality_combo)
+        mode_row.addWidget(self.quality_lbl)
+        mode_row.addWidget(self.quality_combo)
+        composer.addLayout(mode_row)
+
+        self.start_btn = QPushButton("다운로드")
+        self.start_btn.setObjectName("accentBtn")
+        self.start_btn.setMinimumHeight(46)
+        self.start_btn.clicked.connect(self.enqueue)
+        self.start_btn.setEnabled(False)
+        composer.addWidget(self.start_btn)
+        self.feedback_lbl = QLabel("여러 링크도 한 번에 붙여넣을 수 있어요.")
+        self.feedback_lbl.setObjectName("hint")
+        self.feedback_lbl.setWordWrap(True)
+        composer.addWidget(self.feedback_lbl)
+        lay.addWidget(card)
+
+        destination = QVBoxLayout()
+        destination.setSpacing(6)
+        folder_row = QHBoxLayout()
+        folder_lbl = QLabel("저장 위치")
+        folder_lbl.setObjectName("hint")
         self.folder_edit = QLineEdit()
+        self.folder_edit.setObjectName("folderPath")
         self.folder_edit.setReadOnly(True)
-        self.folder_edit.setToolTip("저장 폴더 — 클릭해서 변경")
-        folder_btn = QPushButton("📁 폴더")
+        self.folder_edit.setAccessibleName("저장 폴더 경로")
+        self.folder_edit.textChanged.connect(self.folder_edit.setToolTip)
+        folder_btn = QPushButton("변경")
         folder_btn.clicked.connect(self._pick_folder)
-        opt_row.addWidget(self.quality_lbl)
-        opt_row.addWidget(self.quality_combo)
-        opt_row.addWidget(self.folder_edit, 1)
-        opt_row.addWidget(folder_btn)
-        lay.addLayout(opt_row)
+        folder_row.addWidget(folder_lbl)
+        folder_row.addWidget(self.folder_edit, 1)
+        folder_row.addWidget(folder_btn)
+        destination.addLayout(folder_row)
+        self.options_hint = ElidedLabel()
+        self.options_hint.setObjectName("hint")
+        destination.addWidget(self.options_hint)
+        lay.addLayout(destination)
 
-        # Advanced: cookies / playlist
-        self.adv_btn = QPushButton("⚙ 고급 설정 (인증 · 프록시 · 자막 · 구간 · 병렬) ▾")
-        self.adv_btn.setCheckable(True)
-        self.adv_btn.setObjectName("advBtn")
-        self.adv_btn.toggled.connect(self._toggle_adv)
-        lay.addWidget(self.adv_btn)
-
-        from PySide6.QtWidgets import QScrollArea
-
-        self.adv = QFrame()
-        self.adv.setObjectName("advBox")
-        adv_wrap = QVBoxLayout(self.adv)
-        adv_wrap.setContentsMargins(0, 0, 0, 0)
-        adv_scroll = QScrollArea()
-        adv_scroll.setWidgetResizable(True)
-        adv_scroll.setFrameShape(QScrollArea.NoFrame)
-        adv_scroll.setMaximumHeight(340)
-        adv_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        adv_inner = QWidget()
-        adv_lay = QVBoxLayout(adv_inner)
-        adv_lay.setContentsMargins(12, 10, 12, 10)
-        adv_lay.setSpacing(8)
-
-        cookie_lbl = QLabel(
-            "성인 인증·로그인 필요 영상은 브라우저 쿠키가 필요합니다.\n"
-            "해당 사이트에 로그인된 브라우저를 선택하세요 (다운로드 중 브라우저 종료 권장)."
-        )
-        cookie_lbl.setWordWrap(True)
-        cookie_lbl.setObjectName("hint")
-        adv_lay.addWidget(cookie_lbl)
-
-        ck_row = QHBoxLayout()
-        ck_row.addWidget(QLabel("쿠키 가져올 브라우저"))
-        self.browser_combo = QComboBox()
-        for label, b in BROWSERS:
-            self.browser_combo.addItem(label, b)
-        ck_row.addWidget(self.browser_combo, 1)
-        adv_lay.addLayout(ck_row)
-
-        cf_row = QHBoxLayout()
-        cf_row.addWidget(QLabel("cookies.txt"))
-        self.cookie_file_edit = QLineEdit()
-        self.cookie_file_edit.setPlaceholderText("선택 안 함")
-        cf_btn = QPushButton("찾기")
-        cf_btn.clicked.connect(self._pick_cookie_file)
-        cf_row.addWidget(self.cookie_file_edit, 1)
-        cf_row.addWidget(cf_btn)
-        adv_lay.addLayout(cf_row)
-
-        self.playlist_chk = QCheckBox("재생목록 링크는 항상 전체 다운로드")
-        adv_lay.addWidget(self.playlist_chk)
-
-        bypass_lbl = QLabel(
-            "국가·ISP 차단 우회 (warning.or.kr 등): 로컬/원격 프록시 경유\n"
-            "예) socks5://127.0.0.1:1080  ·  http://127.0.0.1:8080"
-        )
-        bypass_lbl.setWordWrap(True)
-        bypass_lbl.setObjectName("hint")
-        adv_lay.addWidget(bypass_lbl)
-
-        px_row = QHBoxLayout()
-        px_row.addWidget(QLabel("프록시"))
-        self.proxy_edit = QLineEdit()
-        self.proxy_edit.setPlaceholderText("비워두면 직접 연결")
-        px_row.addWidget(self.proxy_edit, 1)
-        adv_lay.addLayout(px_row)
-
-        self.geo_chk = QCheckBox("지역 제한 우회 (yt-dlp geo-bypass)")
-        adv_lay.addWidget(self.geo_chk)
-        self.adv.hide()
-
-
-        sec_lbl = QLabel("일부만 받기 (선택) — 시:분:초 또는 분:초")
-        sec_lbl.setObjectName("hint")
-        adv_lay.addWidget(sec_lbl)
-        sec_row = QHBoxLayout()
-        self.sec_start = QLineEdit()
-        self.sec_start.setPlaceholderText("시작  예) 0:30")
-        self.sec_end = QLineEdit()
-        self.sec_end.setPlaceholderText("끝  예) 2:15")
-        sec_row.addWidget(self.sec_start)
-        sec_row.addWidget(QLabel("~"))
-        sec_row.addWidget(self.sec_end)
-        adv_lay.addLayout(sec_row)
-
-        self.subs_chk = QCheckBox("자막도 저장 (한국어/영어 .srt)")
-        adv_lay.addWidget(self.subs_chk)
-        self.dedup_chk = QCheckBox("이미 받은 항목 건너뛰기 (다운로드 이력 기억)")
-        self.dedup_chk.setChecked(True)
-        adv_lay.addWidget(self.dedup_chk)
-        self.clip_chk = QCheckBox("클립보드 감시 — 링크 복사하면 바로 다운로드")
-        adv_lay.addWidget(self.clip_chk)
-        self.autoproxy_chk = QCheckBox(
-            "로컬 우회툴 자동 연결 (GoodbyeDPI·Psiphon·Clash 등 켜져 있으면 자동 감지)"
-        )
-        self.autoproxy_chk.setChecked(True)
-        adv_lay.addWidget(self.autoproxy_chk)
-
-        par_row = QHBoxLayout()
-        par_row.addWidget(QLabel("동시 다운로드"))
-        from PySide6.QtWidgets import QSpinBox
-
-        self.parallel_spin = QSpinBox()
-        self.parallel_spin.setRange(1, 4)
-        self.parallel_spin.setValue(2)
-        self.parallel_spin.valueChanged.connect(
-            lambda v: setattr(self.worker, "max_parallel", v)
-        )
-        par_row.addWidget(self.parallel_spin)
-        par_row.addStretch(1)
-        adv_lay.addLayout(par_row)
-        adv_scroll.setWidget(adv_inner)
-        adv_wrap.addWidget(adv_scroll)
-        lay.addWidget(self.adv)
-
-        # Queue
         q_row = QHBoxLayout()
-        self.summary_lbl = QLabel("대기 중인 항목 없음")
+        queue_title = QLabel("다운로드 목록")
+        queue_title.setObjectName("sectionTitle")
+        self.summary_lbl = ElidedLabel("아직 다운로드가 없어요")
         self.summary_lbl.setObjectName("appSub")
-        clear_btn = QPushButton("완료 항목 정리")
-        clear_btn.setObjectName("ghostBtn")
-        clear_btn.clicked.connect(self._clear_finished)
+        self.clear_btn = QPushButton("완료 항목 정리")
+        self.clear_btn.setObjectName("ghostBtn")
+        self.clear_btn.setToolTip("완료·취소된 항목만 목록에서 제거합니다. 파일은 삭제하지 않습니다.")
+        self.clear_btn.clicked.connect(self._clear_finished)
+        q_row.addWidget(queue_title)
         q_row.addWidget(self.summary_lbl, 1)
-        q_row.addWidget(clear_btn)
+        q_row.addWidget(self.clear_btn)
         lay.addLayout(q_row)
 
         self.list = QListWidget()
-        self.list.setSpacing(4)
+        self.list.setSpacing(6)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.list.setResizeMode(QListWidget.Adjust)
         self.list.itemDoubleClicked.connect(self._open_row_folder)
-
-        # 빈 상태 ↔ 목록: 스택으로 전환 (오버레이 좌표 버그 방지)
-        from PySide6.QtWidgets import QStackedWidget
-
         self.stack = QStackedWidget()
-        empty_page = QWidget()
+        empty_page = QFrame()
         empty_page.setObjectName("emptyPage")
         ep = QVBoxLayout(empty_page)
-        ep.addStretch(1)
-        big = QLabel("⬇")
-        big.setAlignment(Qt.AlignCenter)
-        big.setStyleSheet("color: #C9B88A; font-size: 30px;")
-        empty_txt = QLabel("여기로 링크를 드래그하거나\n위 칸에 붙여넣으세요")
+        ep.setContentsMargins(16, 16, 16, 16)
+        ep.setSpacing(8)
+        ep.addStretch()
+        empty_icon = QLabel()
+        empty_icon.setObjectName("emptyMascot")
+        empty_icon.setFixedSize(80, 80)
+        empty_icon.setAlignment(Qt.AlignCenter)
+        mascot = QPixmap(_res("mascot.png")).scaled(160, 160, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        mascot.setDevicePixelRatio(2)
+        empty_icon.setPixmap(mascot)
+        ep.addWidget(empty_icon, 0, Qt.AlignHCenter)
+        empty_title = QLabel("좋아하는 순간을 담아보세요")
+        empty_title.setObjectName("emptyTitle")
+        empty_title.setAlignment(Qt.AlignCenter)
+        empty_txt = QLabel("링크를 붙여넣거나 여기로 끌어오세요.")
+        empty_txt.setObjectName("hint")
         empty_txt.setAlignment(Qt.AlignCenter)
-        empty_txt.setStyleSheet("color: #C9B88A; font-size: 15px;")
-        ep.addWidget(big)
+        empty_txt.setWordWrap(True)
+        ep.addWidget(empty_title)
         ep.addWidget(empty_txt)
-        ep.addStretch(1)
+        ep.addStretch()
         self.stack.addWidget(empty_page)
         self.stack.addWidget(self.list)
-        self.stack.setCurrentIndex(0)
         lay.addWidget(self.stack, 1)
 
-        hint = QLabel("목록 항목 더블클릭 → 저장 폴더 열기")
+        key = "⌘" if sys.platform == "darwin" else "Ctrl"
+        hint = QLabel(f"{key}+V 붙여넣기  ·  Enter 다운로드  ·  {key}+L 링크 입력")
         hint.setObjectName("appSub")
         hint.setAlignment(Qt.AlignCenter)
         lay.addWidget(hint)
-
+        focus_shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
+        focus_shortcut.activated.connect(self.url_edit.setFocus)
+        focus_shortcut.activated.connect(self.url_edit.selectAll)
+        paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste, self)
+        paste_shortcut.activated.connect(self._paste)
         self.setCentralWidget(root)
+        self._build_settings()
         self.setStyleSheet(
             """
-            QMainWindow, QWidget { background: #FFF6E3; color: #3E2723; }
-            #appTitle { font-size: 26px; font-weight: 800; color: #3E2723; }
-            #appSub, #hint, #statusLbl { color: #8D6E63; font-size: 12px; }
+            QWidget { color: #352E27; font-size: 13px; }
+            QMainWindow, #window, QDialog { background: #FBF8F4; }
+            QLabel { background: transparent; }
+            #appTitle { color: #48372B; font-size: 28px; font-weight: 700; letter-spacing: -1px; }
+            #brandMark { background: #F5EBD8; border-radius: 20px; }
+            #sectionTitle, #emptyTitle { font-size: 16px; font-weight: 600; }
+            #appSub, #hint, #statusLbl { color: #736F66; font-size: 12px; }
+            #downloadCard, #jobRow {
+                background: #FFFFFF; border: 1px solid #E9E2D9; border-radius: 18px;
+            }
             QLineEdit, QComboBox {
-                background: #FFFBEF; border: 2px solid #DCCB9E; border-radius: 8px;
-                padding: 7px 10px; selection-background-color: #FFD159;
+                background: #FFFFFF; border: 1px solid #DDD5CA; border-radius: 11px;
+                padding: 9px 10px; selection-background-color: #F6D7C0;
+                selection-color: #282620;
             }
-            QLineEdit:focus, QComboBox:focus { border-color: #FF8F3D; }
+            QLineEdit:focus, QComboBox:focus { border: 1px solid #B84E23; }
+            #urlInput { background: #FCFAF7; font-size: 14px; }
+            #folderPath { background: transparent; border: none; color: #736F66; padding: 6px; }
+            QComboBox { padding-right: 26px; }
             QComboBox::drop-down { border: none; width: 24px; }
+            QComboBox::down-arrow { image: none; }
+            QComboBox QAbstractItemView {
+                background: #FFFFFF; color: #282620;
+                selection-background-color: #F6E9DD; selection-color: #282620;
+            }
             QPushButton {
-                background: #FFFBEF; border: 2px solid #DCCB9E; border-radius: 8px;
-                padding: 7px 14px; color: #3E2723;
+                background: #FFFFFF; border: 1px solid #DDD5CA; border-radius: 11px;
+                padding: 8px 14px; font-weight: 500;
             }
-            QPushButton:hover { background: #FFF0C8; border-color: #FF8F3D; }
-            QPushButton:pressed { background: #FFE1A8; }
-            QPushButton[checkable="true"]:checked {
-                background: #FFD159; border: 2px solid #3E2723; font-weight: 700;
-            }
-            #jobRow {
-                background: #FFFBEF; border: 2px solid #DCCB9E; border-radius: 10px;
-            }
-            #advBox { background: #FFFBEF; border: 2px dashed #DCCB9E; border-radius: 10px; }
-            #advBtn { text-align: left; border: none; color: #8D6E63; padding: 2px 4px; }
-            #advBtn:hover { color: #3E2723; }
-            #ghostBtn { border: none; color: #8D6E63; }
-            #ghostBtn:hover { color: #3E2723; text-decoration: underline; }
-            QListWidget, #emptyPage {
-                background: #FFF9EA; border: 2px solid #DCCB9E; border-radius: 10px;
-            }
-            #emptyPage { border-style: dashed; }
+            QPushButton:hover { background: #F1F0EB; border-color: #AAA59B; }
+            QPushButton:pressed { background: #E8E5DE; }
+            QPushButton:focus { border: 1px solid #B84E23; }
+            QPushButton:disabled { color: #938E84; border-color: #E4E2DC; background: #F1F0EC; }
+            #pasteBtn { color: #805638; background: #F7EFE5; border-color: #EADCCD; }
+            #pasteBtn:hover { background: #F0E2D1; border-color: #D6BFA6; }
+            #pasteBtn:focus { border-color: #B84E23; }
+            #modeSwitch { background: #F5F0E9; border-radius: 13px; }
+            #modeBtn { background: transparent; border-color: transparent; color: #736F66; }
+            #modeBtn:checked { color: #983F1C; background: #FFFFFF; border-color: #E2D1C1; font-weight: 600; }
+            #modeBtn:focus { border-color: #B84E23; }
+            #accentBtn { background: #B84E23; color: #FFFFFF; border-color: #B84E23; font-weight: 600; }
+            #accentBtn:hover { background: #9E401C; border-color: #9E401C; }
+            #accentBtn:pressed { background: #833316; }
+            #accentBtn:focus { border: 2px solid #713015; }
+            #accentBtn:disabled { background: #F4E7DD; border-color: #F4E7DD; color: #9B735B; }
+            #ghostBtn { background: transparent; border-color: transparent; color: #736F66; }
+            #ghostBtn:hover, #ghostBtn:focus { background: #EBE9E3; border-color: #D8D5CE; }
+            #ghostBtn:disabled { color: #A9A499; }
+            QListWidget { background: transparent; border: none; outline: none; }
             QListWidget::item { border: none; }
-            QProgressBar {
-                border: none; border-radius: 5px; background: #EFE3C3;
+            QListWidget::item:selected { background: #F6E9DD; border-radius: 14px; }
+            #emptyPage { background: #F5EFE5; border: 1px solid #EBE1D2; border-radius: 20px; }
+            #emptyTitle { color: #64513F; }
+            #jobTitle { font-weight: 600; }
+            #mediaBadge { color: #8D6546; background: #F6EDE2; border-radius: 8px; font-size: 11px; font-weight: 600; }
+            QProgressBar { border: none; border-radius: 3px; background: #EEECE6; }
+            QProgressBar::chunk { border-radius: 3px; background: #B84E23; }
+            QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }
+            QScrollBar:vertical { background: transparent; width: 10px; margin: 4px 1px; }
+            QScrollBar::handle:vertical { background: #C9C3B9; border-radius: 4px; min-height: 32px; }
+            QScrollBar::handle:vertical:hover { background: #A69C8E; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; border: none; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+            QTabWidget::pane { background: #FFFFFF; border: 1px solid #E4E2DC; border-radius: 10px; }
+            QTabBar::tab {
+                background: transparent; border: none; border-bottom: 2px solid transparent;
+                padding: 12px 18px; color: #736F66;
             }
-            QProgressBar::chunk { border-radius: 5px; background: #FF8F3D; }
-            QToolTip { background: #3E2723; color: #FFF6E3; border: none; padding: 6px; }
-            #accentBtn { background: #FF8F3D; border-color: #E8721C; color: #fff; font-weight: 700; }
-            #accentBtn:hover { background: #F57C00; }
-            #accentBtn:disabled { background: #DCCB9E; border-color: #DCCB9E; }
-            QSpinBox {
-                background: #FFFBEF; border: 2px solid #DCCB9E; border-radius: 8px;
-                padding: 4px 8px; min-width: 54px;
-            }
-            QSpinBox:focus { border-color: #FF8F3D; }
+            QTabBar::tab:selected { color: #983F1C; border-bottom-color: #B84E23; font-weight: 600; }
+            QTabBar::tab:hover { background: #F6EDE2; }
+            QCheckBox { spacing: 12px; padding: 6px 0; }
+            QCheckBox::indicator { width: 20px; height: 20px; border: none; background: transparent; image: none; }
+            QToolTip { background: #282620; color: #FFFFFF; border: none; padding: 8px; }
             """
         )
-
         self.setWindowIcon(QIcon(_res("icon.png")))
         self._set_mode(self.settings.value("mode", "video"))
+
+    def _build_settings(self) -> None:
+        self.adv = QDialog(self)
+        self.adv.setWindowTitle("Dawn 설정")
+        self.adv.resize(560, 520)
+        self.adv.setMinimumSize(500, 440)
+        layout = QVBoxLayout(self.adv)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+        settings_title = QLabel("내게 맞게 설정")
+        settings_title.setObjectName("sectionTitle")
+        layout.addWidget(settings_title)
+        tabs = QTabWidget()
+        layout.addWidget(tabs)
+
+        def page(title):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            inner = QWidget()
+            column = QVBoxLayout(inner)
+            column.setContentsMargins(20, 20, 20, 20)
+            column.setSpacing(12)
+            scroll.setWidget(inner)
+            tabs.addTab(scroll, title)
+            return column
+
+        download = page("다운로드")
+        self.auto_chk = OptionCheckBox("붙여넣은 링크 자동 다운로드")
+        self.auto_chk.setToolTip("켜면 링크를 붙여넣고 0.7초 후 현재 설정으로 시작합니다.")
+        self.auto_chk.toggled.connect(lambda _: self._auto_timer.stop())
+        self.playlist_chk = OptionCheckBox("재생목록 링크는 항상 전체 다운로드")
+        self.subs_chk = OptionCheckBox("자막도 저장 (한국어 / 영어 .srt)")
+        self.dedup_chk = OptionCheckBox("이미 받은 항목 건너뛰기")
+        self.clip_chk = OptionCheckBox("클립보드 감시 · 링크 복사 시 바로 다운로드")
+        for control in (self.auto_chk, self.playlist_chk, self.subs_chk, self.dedup_chk, self.clip_chk):
+            download.addWidget(control)
+        section_lbl = QLabel("일부만 받기 · 비워두면 전체 저장")
+        section_lbl.setObjectName("hint")
+        download.addWidget(section_lbl)
+        section_row = QHBoxLayout()
+        self.sec_start = QLineEdit()
+        self.sec_start.setPlaceholderText("시작  0:30")
+        self.sec_start.setAccessibleName("구간 시작 시간")
+        self.sec_end = QLineEdit()
+        self.sec_end.setPlaceholderText("끝  2:15")
+        self.sec_end.setAccessibleName("구간 끝 시간")
+        section_row.addWidget(self.sec_start)
+        section_row.addWidget(QLabel("~"))
+        section_row.addWidget(self.sec_end)
+        download.addLayout(section_row)
+        parallel_row = QHBoxLayout()
+        parallel_row.addWidget(QLabel("동시 다운로드"))
+        self.parallel_combo = Dropdown()
+        for count in range(1, 5):
+            self.parallel_combo.addItem(f"{count}개", count)
+        self.parallel_combo.setMinimumWidth(100)
+        self.parallel_combo.setAccessibleName("동시 다운로드 수")
+        self.parallel_combo.currentIndexChanged.connect(
+            lambda _: setattr(self.worker, "max_parallel", self.parallel_combo.currentData())
+        )
+        parallel_row.addWidget(self.parallel_combo)
+        parallel_row.addStretch()
+        download.addLayout(parallel_row)
+        download.addStretch()
+
+        login = page("로그인")
+        cookie_lbl = QLabel("로그인·성인 인증이 필요한 콘텐츠에만 설정하세요.\n로그인한 브라우저를 선택하고, 다운로드 중에는 종료해 주세요.")
+        cookie_lbl.setWordWrap(True)
+        cookie_lbl.setObjectName("hint")
+        login.addWidget(cookie_lbl)
+        login.addWidget(QLabel("쿠키를 가져올 브라우저"))
+        self.browser_combo = Dropdown()
+        self.browser_combo.setAccessibleName("로그인된 브라우저")
+        for label, browser in BROWSERS:
+            self.browser_combo.addItem(label, browser)
+        login.addWidget(self.browser_combo)
+        login.addWidget(QLabel("또는 cookies.txt 파일"))
+        cookie_row = QHBoxLayout()
+        self.cookie_file_edit = QLineEdit()
+        self.cookie_file_edit.setPlaceholderText("선택 안 함")
+        self.cookie_file_edit.setAccessibleName("쿠키 파일 경로")
+        self.cookie_file_edit.setClearButtonEnabled(True)
+        cookie_btn = QPushButton("찾기")
+        cookie_btn.clicked.connect(self._pick_cookie_file)
+        cookie_row.addWidget(self.cookie_file_edit, 1)
+        cookie_row.addWidget(cookie_btn)
+        login.addLayout(cookie_row)
+        login.addStretch()
+
+        network = page("네트워크")
+        self.dpi_chk = OptionCheckBox("DPI 검열 우회 사용")
+        network.addWidget(self.dpi_chk)
+        if sys.platform == "win32":
+            explanation = (
+                "GoodbyeDPI로 패킷을 분할하고 DNS 요청을 1.1.1.1로 보냅니다.\n"
+                "관리자 권한 필요 · 실행 중 다른 앱의 네트워크에도 영향을 줄 수 있어요."
+            )
+        else:
+            explanation = (
+                "SpoofDPI로 TLS 패킷 분할 + 암호화 DNS(1.1.1.1)를 사용합니다.\n"
+                "Dawn의 다운로드에만 적용되며 시스템 프록시 설정은 바꾸지 않습니다."
+            )
+        dpi_description = QLabel(explanation + "\nIP 차단·로그인 제한은 해결하지 못할 수 있습니다.")
+        dpi_description.setObjectName("hint")
+        dpi_description.setWordWrap(True)
+        network.addWidget(dpi_description)
+        self.bypass_status = QLabel()
+        self.bypass_status.setObjectName("hint")
+        self.bypass_status.setWordWrap(True)
+        network.addWidget(self.bypass_status)
+        self.admin_btn = QPushButton("관리자 권한으로 다시 열기")
+        self.admin_btn.clicked.connect(self._restart_admin)
+        network.addWidget(self.admin_btn)
+        proxy_lbl = QLabel("우회를 끄면 아래 프록시 설정을 사용합니다.\n직접 입력한 프록시가 자동 감지보다 우선합니다.")
+        proxy_lbl.setWordWrap(True)
+        proxy_lbl.setObjectName("hint")
+        network.addWidget(proxy_lbl)
+        network.addWidget(QLabel("프록시 주소"))
+        self.proxy_edit = QLineEdit()
+        self.proxy_edit.setPlaceholderText("예: socks5://127.0.0.1:1080")
+        self.proxy_edit.setAccessibleName("프록시 주소")
+        self.proxy_edit.setClearButtonEnabled(True)
+        network.addWidget(self.proxy_edit)
+        self.geo_chk = OptionCheckBox("지역 제한 우회 (geo-bypass)")
+        self.autoproxy_chk = OptionCheckBox("실행 중인 HTTP 프록시 자동 감지")
+        network.addWidget(self.geo_chk)
+        network.addWidget(self.autoproxy_chk)
+        self.dpi_chk.toggled.connect(self._update_bypass_controls)
+        network.addStretch()
+        footer = QHBoxLayout()
+        note = QLabel("변경한 설정은 다음 다운로드부터 적용됩니다.")
+        note.setObjectName("hint")
+        note.setWordWrap(True)
+        footer.addWidget(note, 1)
+        close_btn = QPushButton("확인")
+        close_btn.setObjectName("accentBtn")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.adv.accept)
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
+        self.adv.finished.connect(self._settings_finished)
 
     # ----- settings -----
 
@@ -668,11 +848,9 @@ class MainWindow(QMainWindow):
         default_dir = os.path.join(
             QStandardPaths.writableLocation(QStandardPaths.DownloadLocation), "Dawn"
         )
-        self.folder_edit.setText(self.settings.value("outdir", default_dir))
-        self._restore_combo("vquality", "best")
-        self._restore_combo("aquality", "mp3:0")
-        self.parallel_spin.setValue(int(self.settings.value("parallel", 2)))
-        self.worker.max_parallel = self.parallel_spin.value()
+        self.folder_edit.setText(self.settings.value("outdir", "") or default_dir)
+        self.parallel_combo.setCurrentIndex(max(0, min(3, int(self.settings.value("parallel", 2)) - 1)))
+        self.worker.max_parallel = self.parallel_combo.currentData()
         bi = self.settings.value("cookie_browser", "")
         for i in range(self.browser_combo.count()):
             if (self.browser_combo.itemData(i) or "") == bi:
@@ -684,8 +862,14 @@ class MainWindow(QMainWindow):
         self.autoproxy_chk.setChecked(
             self.settings.value("autoproxy", True, type=bool)
         )
-        if self.settings.value("adv_open", False, type=bool):
-            self.adv_btn.setChecked(True)
+        self.auto_chk.setChecked(self.settings.value("auto_start", False, type=bool))
+        self.sec_start.setText(self.settings.value("sec_start", ""))
+        self.sec_end.setText(self.settings.value("sec_end", ""))
+        self.subs_chk.setChecked(self.settings.value("subtitles", False, type=bool))
+        self.dedup_chk.setChecked(self.settings.value("dedup", True, type=bool))
+        self.clip_chk.setChecked(self.settings.value("clip_watch", False, type=bool))
+        self.dpi_chk.setChecked(self.settings.value("dpi_bypass", False, type=bool))
+        self._update_bypass_controls()
 
     def _restore_combo(self, key: str, default: str) -> None:
         want = self.settings.value(key, default)
@@ -702,16 +886,17 @@ class MainWindow(QMainWindow):
         self.settings.setValue("cookie_browser", self.browser_combo.currentData() or "")
         self.settings.setValue("cookie_file", self.cookie_file_edit.text())
         self.settings.setValue("playlist", self.playlist_chk.isChecked())
-        self.settings.setValue("adv_open", self.adv_btn.isChecked())
+        self.settings.setValue("auto_start", self.auto_chk.isChecked())
         self.settings.setValue("proxy", self.proxy_edit.text())
         self.settings.setValue("geo_bypass", self.geo_chk.isChecked())
         self.settings.setValue("autoproxy", self.autoproxy_chk.isChecked())
+        self.settings.setValue("dpi_bypass", self.dpi_chk.isChecked())
         self.settings.setValue("sec_start", self.sec_start.text())
         self.settings.setValue("sec_end", self.sec_end.text())
         self.settings.setValue("subtitles", self.subs_chk.isChecked())
         self.settings.setValue("dedup", self.dedup_chk.isChecked())
         self.settings.setValue("clip_watch", self.clip_chk.isChecked())
-        self.settings.setValue("parallel", self.parallel_spin.value())
+        self.settings.setValue("parallel", self.parallel_combo.currentData())
 
     # ----- actions -----
 
@@ -734,25 +919,119 @@ class MainWindow(QMainWindow):
         self._restore_combo("vquality" if mode == "video" else "aquality",
                             "best" if mode == "video" else "mp3:0")
 
-    def _toggle_adv(self, on: bool) -> None:
-        self.adv.setVisible(on)
-        self.adv_btn.setText("⚙ 고급 설정 (인증 · 프록시 · 자막 · 구간 · 병렬) " + ("▴" if on else "▾"))
+    def _show_settings(self) -> None:
+        self._auto_timer.stop()
+        self._update_bypass_controls()
+        self.adv.open()
+
+    def _settings_finished(self) -> None:
+        self._save_settings()
+        self._update_options_hint()
+        self._on_url_changed(self.url_edit.text())
+        self.url_edit.setFocus()
+
+    def _update_bypass_controls(self) -> None:
+        enabled = self.dpi_chk.isChecked()
+        self.proxy_edit.setEnabled(not enabled)
+        self.autoproxy_chk.setEnabled(not enabled)
+        self.admin_btn.setVisible(sys.platform == "win32" and not is_admin())
+        engine = find_bypass_engine()
+        if not engine:
+            text = "우회 엔진 없음 · 앱을 다시 설치하거나 개발 환경에서 scripts/fetch_bypass.py를 실행하세요."
+        elif sys.platform == "win32" and not is_admin():
+            text = "엔진 준비됨 · 우회 사용 전 관리자 권한으로 다시 열어 주세요."
+        else:
+            text = "엔진 준비됨 · 다운로드할 때 시작하고 작업이 끝나면 종료합니다."
+        self.bypass_status.setText(text)
+
+    def _restart_admin(self) -> None:
+        if sys.platform != "win32" or is_admin():
+            return
+        if any(row.status in ("wait", "extract", "downloading", "postprocess") for _, row in self._rows.values()):
+            QMessageBox.information(self, "작업 진행 중", "다운로드가 끝나거나 취소된 뒤 다시 열어 주세요.")
+            return
+        import ctypes
+        import subprocess
+        from ctypes import wintypes
+
+        self._save_settings()
+        self.settings.sync()
+        args = [] if getattr(sys, "frozen", False) else [
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
+        ]
+        shell_execute = ctypes.windll.shell32.ShellExecuteW
+        shell_execute.argtypes = [
+            wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR,
+            wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int,
+        ]
+        shell_execute.restype = ctypes.c_void_p
+        # A restarted onefile app must unpack its own resources before this
+        # instance exits and removes its temporary bundle (PyInstaller >= 6.9).
+        previous_reset = os.environ.get("PYINSTALLER_RESET_ENVIRONMENT")
+        os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        try:
+            result = shell_execute(None, "runas", sys.executable, subprocess.list2cmdline(args), None, 1)
+        finally:
+            if previous_reset is None:
+                os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+            else:
+                os.environ["PYINSTALLER_RESET_ENVIRONMENT"] = previous_reset
+        if not result or result <= 32:
+            QMessageBox.warning(self, "관리자 권한 요청", "권한 요청이 취소되었거나 실행하지 못했습니다. 현재 창은 유지합니다.")
+            return
+        self.adv.accept()
+        self.close()
+
+    def _update_options_hint(self) -> None:
+        options = []
+        if self.auto_chk.isChecked():
+            options.append("붙여넣기 자동 시작")
+        if self.clip_chk.isChecked():
+            options.append("클립보드 감시 켜짐")
+        if self.playlist_chk.isChecked():
+            options.append("재생목록 전체")
+        if self.subs_chk.isChecked():
+            options.append("자막 저장")
+        if self.sec_start.text() or self.sec_end.text():
+            options.append(f"구간 {self.sec_start.text() or '0:00'} ~ {self.sec_end.text() or '끝'}")
+        if self.browser_combo.currentData() or self.cookie_file_edit.text():
+            options.append("로그인 쿠키 사용")
+        if self.dpi_chk.isChecked():
+            options.append("DPI 우회 · " + ("GoodbyeDPI" if sys.platform == "win32" else "SpoofDPI"))
+        elif self.proxy_edit.text():
+            options.append("프록시 사용")
+        self.options_hint.setText(" · ".join(options))
+        self.options_hint.setToolTip(self.options_hint._full)
+        self.options_hint.setVisible(bool(options))
 
     def _paste(self) -> None:
-        self.url_edit.setText(QApplication.clipboard().text().strip())
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            self.feedback_lbl.setText("클립보드가 비어 있어요. 먼저 링크를 복사해 주세요.")
+            return
+        self.url_edit.setText(text)
+        self.url_edit.setFocus()
 
     def _on_url_changed(self, text: str) -> None:
-        # 붙여넣기/드롭 = 큰 덩어리 입력일 때만 자동 시작; 타이핑은 건드리지 않음
-        prev = getattr(self, "_prev_url_len", 0)
-        self._prev_url_len = len(text or "")
-        grew_by_paste = len(text or "") - prev >= 10
-        if grew_by_paste and URL_RE.search(text or ""):
-            self._auto_timer.start()
+        urls = URL_RE.findall(text)
+        self.start_btn.setEnabled(bool(urls))
+        self.start_btn.setText(f"{len(urls)}개 다운로드" if len(urls) > 1 else "다운로드")
+        if urls:
+            message = f"링크 {len(urls)}개 준비됨 · 형식과 화질을 확인한 뒤 시작하세요."
+        elif text.strip():
+            message = "http:// 또는 https://로 시작하는 링크를 입력해 주세요."
         else:
-            self._auto_timer.stop()
+            message = "여러 링크도 한 번에 붙여넣을 수 있어요."
+        prev = getattr(self, "_prev_url_len", 0)
+        self._prev_url_len = len(text)
+        self._auto_timer.stop()
+        if self.auto_chk.isChecked() and len(text) - prev >= 10 and urls:
+            self._auto_timer.start()
+            message = "자동 다운로드를 시작합니다…"
+        self.feedback_lbl.setText(message)
 
     def _auto_enqueue(self) -> None:
-        if self.url_edit.text().strip():
+        if self.auto_chk.isChecked() and self.url_edit.text().strip():
             self.enqueue()
 
     def _pick_folder(self) -> None:
@@ -769,27 +1048,44 @@ class MainWindow(QMainWindow):
 
     def enqueue(self) -> None:
         self._auto_timer.stop()
-        text = self.url_edit.text().strip()
-        urls = URL_RE.findall(text)
+        urls = URL_RE.findall(self.url_edit.text().strip())
         if not urls:
-            self.url_edit.setPlaceholderText("🔗 링크를 붙여넣으세요! (https://…)")
+            self.feedback_lbl.setText("다운로드할 링크를 먼저 입력해 주세요.")
+            self.url_edit.setFocus()
             return
-        playlist_cache = {}  # don't re-ask the same playlist choice per batch
+        playlist_cache = {}
+        added = 0
+        duplicates = 0
+        remaining = []
         for url in urls:
-            self._enqueue_url(url, playlist_cache)
-        self.url_edit.clear()
+            if self._url_active(url):
+                duplicates += 1
+            elif self._enqueue_url(url, playlist_cache):
+                added += 1
+            else:
+                remaining.append(url)
+        self.url_edit.setText(" ".join(remaining))
+        self._auto_timer.stop()
+        if remaining:
+            self.feedback_lbl.setText("저장 폴더를 만들 수 없어요. 저장 위치를 변경한 뒤 다시 시작해 주세요.")
+        else:
+            parts = [f"{added}개를 다운로드 목록에 추가했어요."] if added else []
+            if duplicates:
+                parts.append(f"이미 진행 중인 링크 {duplicates}개는 제외했어요.")
+            self.feedback_lbl.setText(" ".join(parts))
+        self._save_settings()
+        self.url_edit.setFocus()
 
-    def _enqueue_url(self, url: str, playlist_cache: dict | None = None) -> None:
-        """Enqueue one URL (shared by paste, Enter, drag&drop)."""
+    def _enqueue_url(self, url: str, playlist_cache: dict | None = None) -> bool:
+        """Queue a URL using the currently selected download options."""
         if self._url_active(url):
-            return
+            return False
         outdir = self.folder_edit.text().strip()
         try:
             os.makedirs(outdir, exist_ok=True)
         except OSError:
-            outdir = os.path.expanduser("~/Downloads/Dawn")
-            self.folder_edit.setText(outdir)
-            os.makedirs(outdir, exist_ok=True)
+            self.feedback_lbl.setText("저장 폴더를 만들 수 없어요. 저장 위치를 변경해 주세요.")
+            return False
         codec_q = self._job_quality()
         job = DownloadJob(
             url=url,
@@ -802,13 +1098,16 @@ class MainWindow(QMainWindow):
                 cookie_file=self.cookie_file_edit.text().strip() or None,
             ),
             playlist=self._resolve_playlist(url, playlist_cache),
-            proxy=self._effective_proxy(),
+            proxy=None if self.dpi_chk.isChecked() else self.proxy_edit.text().strip() or None,
+            dpi_bypass=self.dpi_chk.isChecked(),
+            auto_proxy=self.autoproxy_chk.isChecked() and not self.dpi_chk.isChecked(),
             geo_bypass=self.geo_chk.isChecked(),
             section=self._parse_section(),
             subtitles=self.subs_chk.isChecked(),
             dedup=self.dedup_chk.isChecked(),
         )
         self._add_row(job)
+        return True
 
     def _job_quality(self):
         """Combo data 'codec:q' for audio → (q, codec); video → (q, 'mp3')."""
@@ -869,18 +1168,6 @@ class MainWindow(QMainWindow):
             QApplication.alert(self, 0)
         self._update_summary()
 
-    def _effective_proxy(self) -> "str | None":
-        """Explicit proxy wins; otherwise auto-detect a running local
-        circumvention tool when enabled."""
-        manual = self.proxy_edit.text().strip()
-        if manual:
-            return manual
-        if not self.autoproxy_chk.isChecked():
-            return None
-        found = detect_local_proxy()
-        if found:
-            self.proxy_edit.setPlaceholderText(f"자동 감지됨: {found}")
-        return found
 
     def _resolve_playlist(self, url: str, cache: dict | None = None) -> bool:
         if not is_playlist_url(url):
@@ -910,7 +1197,7 @@ class MainWindow(QMainWindow):
 
     def _clear_finished(self) -> None:
         for job_id, (item, row) in list(self._rows.items()):
-            if row.status in ("done", "error", "cancelled"):
+            if row.status in ("done", "cancelled"):
                 self.list.takeItem(self.list.row(item))
                 del self._rows[job_id]
         self._update_summary()
@@ -924,13 +1211,18 @@ class MainWindow(QMainWindow):
         n_done = sum(1 for _i, r in self._rows.values() if r.status == "done")
         n_fail = sum(1 for _i, r in self._rows.values() if r.status == "error")
         if not self._rows:
-            self.summary_lbl.setText("대기 중인 항목 없음")
+            self.summary_lbl.setText("아직 다운로드가 없어요")
         else:
             bits = [f"진행 {n_run}", f"완료 {n_done}"]
             if n_fail:
                 bits.append(f"실패 {n_fail}")
+            n_cancelled = sum(1 for _i, r in self._rows.values() if r.status == "cancelled")
+            if n_cancelled:
+                bits.append(f"취소 {n_cancelled}")
             self.summary_lbl.setText(" · ".join(bits))
+        self.summary_lbl.setToolTip(self.summary_lbl._full)
         self.stack.setCurrentIndex(0 if not self._rows else 1)
+        self.clear_btn.setEnabled(any(r.status in ("done", "cancelled") for _i, r in self._rows.values()))
 
     def _add_row(self, job: DownloadJob) -> None:
         job_id = self._next_id
@@ -939,14 +1231,16 @@ class MainWindow(QMainWindow):
         row.outdir = job.outdir
         row.job = job
         item = QListWidgetItem()
-        item.setSizeHint(row.sizeHint())
         self.list.addItem(item)
         self.list.setItemWidget(item, row)
+        row.ensurePolished()
+        item.setSizeHint(QSize(0, row.sizeHint().height()))
         self.list.scrollToBottom()
         row.cancelRequested.connect(lambda jid=job_id: self._cancel(jid))
         row.retryRequested.connect(lambda jid=job_id: self._retry(jid))
         self._rows[job_id] = (item, row)
         self.worker.add(job_id, job)
+        self._update_summary()
 
     def _retry(self, job_id: int) -> None:
         pair = self._rows.get(job_id)
@@ -960,7 +1254,9 @@ class MainWindow(QMainWindow):
     def _cancel(self, job_id: int) -> None:
         self.worker.cancel(job_id)
         if job_id in self._rows:
-            self._rows[job_id][1].set_state("cancelled")
+            row = self._rows[job_id][1]
+            row.cancel_btn.setEnabled(False)
+            row.cancel_btn.setText("취소 중")
 
     def _open_row_folder(self, item: QListWidgetItem) -> None:
         row = self.list.itemWidget(item)
@@ -970,17 +1266,18 @@ class MainWindow(QMainWindow):
     # ----- drag & drop -----
 
     def dragEnterEvent(self, e) -> None:
-        if e.mimeData().hasUrls() or e.mimeData().hasText():
+        text = e.mimeData().text() or " ".join(u.toString() for u in e.mimeData().urls())
+        if URL_RE.search(text):
             e.acceptProposedAction()
 
     def dropEvent(self, e) -> None:
-        text = e.mimeData().text()
-        urls = URL_RE.findall(text) if text else [
-            u.toString() for u in e.mimeData().urls()
-        ]
-        for url in urls:
-            self._enqueue_url(url)
-        e.acceptProposedAction()
+        text = e.mimeData().text() or " ".join(u.toString() for u in e.mimeData().urls())
+        urls = URL_RE.findall(text)
+        if urls:
+            existing = self.url_edit.text().strip()
+            self.url_edit.setText(" ".join(filter(None, [existing, *urls])))
+            self.url_edit.setFocus()
+            e.acceptProposedAction()
 
     @Slot(int, dict)
     def _on_progress(self, job_id: int, d: dict) -> None:
@@ -990,7 +1287,7 @@ class MainWindow(QMainWindow):
         _, row = pair
         ev = d.get("event")
         if ev == "info":
-            row.set_state("extract")
+            row.set_state("extract", d.get("message") or "")
         elif ev == "progress":
             if d.get("title"):
                 row.title.setText(d["title"])
@@ -1000,9 +1297,9 @@ class MainWindow(QMainWindow):
                 row.set_progress(d.get("fraction"), d.get("speed"), d.get("eta"))
         elif ev == "title":
             row.title.setText(d.get("title") or row.title.text())
-            thumb = d.get("thumb")
+            thumb = d.get("thumb_data")
             if thumb:
-                self._load_thumb(row, thumb)
+                self._set_thumb(row, thumb)
         elif ev == "pp":
             row.set_state("postprocess")
         elif ev == "done":
@@ -1013,61 +1310,32 @@ class MainWindow(QMainWindow):
             row.set_state("cancelled")
             self._update_summary()
         elif ev == "error":
-            row.set_state("error", (d.get("message") or "")[:160])
+            row.set_state("error", d.get("message") or "다운로드하지 못했어요. 다시 시도해 주세요.")
             row.setToolTip(d.get("message") or "")
             self._update_summary()
         elif ev == "warn":
             row.setToolTip(d.get("message") or "")
 
-    def _load_thumb(self, row: "JobRow", url: str) -> None:
-        """Fetch video thumbnail off-thread and set it as the row icon."""
-        from PySide6.QtGui import QPixmap
-
-        def work():
-            import urllib.request
-
-            try:
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "Mozilla/5.0"}
-                )
-                data = urllib.request.urlopen(req, timeout=10).read()
-            except Exception:
-                return
-            pm = QPixmap()
-            pm.loadFromData(data)
-            if pm.isNull():
-                return
-            # center-crop to square like the embedded album art
-            if pm.width() != pm.height():
-                side = min(pm.width(), pm.height())
-                pm = pm.copy(
-                    (pm.width() - side) // 2, (pm.height() - side) // 2, side, side
-                )
-            pm = pm.scaled(30, 30, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            # marshal to GUI thread
-            from PySide6.QtCore import QMetaObject, Q_ARG
-
-            QMetaObject.invokeMethod(
-                row.icon,
-                "setPixmap",
-                Qt.QueuedConnection,
-                Q_ARG("QPixmap", pm),
-            )
-
-        t = threading.Thread(target=work, daemon=True)
-        t.start()
-        self._thumb_pool.append(t)
+    def _set_thumb(self, row: JobRow, data: bytes) -> None:
+        """Decode artwork already fetched through the job's network route."""
+        pm = QPixmap()
+        pm.loadFromData(data)
+        if pm.isNull():
+            return
+        side = min(pm.width(), pm.height())
+        pm = pm.copy((pm.width() - side) // 2, (pm.height() - side) // 2, side, side)
+        pm = pm.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pm.setDevicePixelRatio(2)
+        row.icon.setPixmap(pm)
 
 
-    def resizeEvent(self, e) -> None:
-        super().resizeEvent(e)
-        # empty/list 전환은 QStackedWidget이 처리 — 수동 reposition 불필요
 
     # ----- lifecycle -----
 
     def closeEvent(self, e) -> None:
         self._save_settings()
         self.worker.stop()
+        shutdown_bypass()
         if not self.worker.wait(3000):
             self.worker.terminate()
             self.worker.wait(1000)

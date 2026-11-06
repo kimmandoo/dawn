@@ -33,10 +33,17 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      - name: Fetch pinned bypass engine and licenses
+        run: python scripts/fetch_bypass.py
+
       - name: Build
         run: python -m PyInstaller dawn.spec --noconfirm --clean
 
+      - name: Verify packaged DPI engine and local audio conversion
+        run: python scripts/smoke_packaged.py --dpi-bypass
+
       - name: Selftest (real download, ffmpeg + ejs + deno smoke)
+        shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
             ./dist/Dawn.exe --selftest "https://www.youtube.com/watch?v=jNQXAC9IVRw"

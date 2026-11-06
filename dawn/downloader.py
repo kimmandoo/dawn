@@ -5,11 +5,14 @@ from __future__ import annotations
 import os
 import re
 import threading
-import urllib.request
-from dataclasses import dataclass, field
+from contextlib import ExitStack
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 import yt_dlp
+from yt_dlp.networking import Request
+
+from .bypass import bypass_connection
 
 def _find_ffmpeg() -> str:
     """Bundled imageio-ffmpeg binary; under PyInstaller it lands in
@@ -75,6 +78,8 @@ class DownloadJob:
     section: Optional[tuple] = None   # (start_s, end_s) seconds, None = whole
     subtitles: bool = False           # write ko/en subs beside file
     dedup: bool = True                # skip already-downloaded via archive
+    dpi_bypass: bool = False          # managed platform-specific DPI engine
+    auto_proxy: bool = False          # discover an existing HTTP proxy in worker
 
 
 def _format_selector(quality: str) -> str:
@@ -132,8 +137,10 @@ def _js_runtimes() -> dict:
 
 
 def detect_local_proxy(timeout: float = 0.4) -> Optional[str]:
-    """Probe common local proxy ports (GoodbyeDPI/Psiphon/Clash-style
-    circumvention tools) and return a working CONNECT proxy URL, if any."""
+    """Probe common local HTTP CONNECT proxy ports.
+
+    GoodbyeDPI is a packet filter, not a proxy; it is managed separately.
+    """
     import socket
     from concurrent.futures import ThreadPoolExecutor
 
@@ -194,7 +201,7 @@ def _ydl_opts(job: DownloadJob) -> dict:
         opts["format"] = _format_selector(job.quality)
         opts["merge_output_format"] = "mp4"
         opts["postprocessors"] = [{"key": "FFmpegMetadata"}]
-    if job.proxy:
+    if job.proxy is not None:
         opts["proxy"] = job.proxy
     if job.geo_bypass:
         opts["geo_bypass"] = True
@@ -216,7 +223,7 @@ def _ydl_opts(job: DownloadJob) -> dict:
     return opts
 
 
-def _best_thumbnail_url(info: dict) -> Optional[str]:
+def _best_thumbnail_url(info: dict, client: yt_dlp.YoutubeDL) -> Optional[str]:
     """Pick the highest-resolution thumbnail. On YouTube the declared list
     often omits maxresdefault.jpg, so probe it first."""
     vid = info.get("id")
@@ -224,10 +231,8 @@ def _best_thumbnail_url(info: dict) -> Optional[str]:
     if vid and "youtube" in extractor:
         yield_url = f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg"
         try:
-            req = urllib.request.Request(
-                yield_url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"}
-            )
-            with urllib.request.urlopen(req, timeout=10) as r:
+            req = Request(yield_url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+            with client.urlopen(req) as r:
                 if r.status == 200:
                     return yield_url
         except Exception:
@@ -241,13 +246,13 @@ def _best_thumbnail_url(info: dict) -> Optional[str]:
     return best.get("url") or info.get("thumbnail")
 
 
-def _fetch_thumbnail(info: dict, timeout: int = 20) -> Optional[bytes]:
-    url = _best_thumbnail_url(info)
+def _fetch_thumbnail(info: dict, client: yt_dlp.YoutubeDL) -> Optional[bytes]:
+    url = _best_thumbnail_url(info, client)
     if not url:
         return None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with client.urlopen(req) as r:
             return r.read()
     except Exception:
         return None
@@ -303,12 +308,7 @@ def _try_download(
 def _no_subs(job: DownloadJob) -> DownloadJob:
     """Clone job with subtitles disabled (429/region-locked subs shouldn't
     kill the media download)."""
-    return DownloadJob(
-        url=job.url, mode=job.mode, outdir=job.outdir, quality=job.quality,
-        cookies=job.cookies, playlist=job.playlist, proxy=job.proxy,
-        geo_bypass=job.geo_bypass, section=job.section,
-        subtitles=False, dedup=job.dedup, audio_codec=job.audio_codec,
-    )
+    return replace(job, subtitles=False)
 
 
 def _final_files(info: dict):
@@ -324,7 +324,7 @@ def _final_files(info: dict):
         yield from _final_files(entry)
 
 
-def _tag_audio_files(info: dict, progress: ProgressCb, cancel: threading.Event) -> None:
+def _tag_audio_files(info: dict, progress: ProgressCb, cancel: threading.Event, client: yt_dlp.YoutubeDL) -> None:
     for ent, path in _final_files(info):
         if cancel.is_set():
             raise Cancelled()
@@ -332,7 +332,7 @@ def _tag_audio_files(info: dict, progress: ProgressCb, cancel: threading.Event) 
         if ext not in (".mp3", ".m4a", ".flac") or not os.path.exists(path):
             continue
         try:
-            raw = _fetch_thumbnail(ent) or _sidecar_thumbnail(path)
+            raw = _fetch_thumbnail(ent, client) or _sidecar_thumbnail(path)
             jpeg = _square_jpeg(raw) if raw else None
             if ext == ".mp3":
                 embed_audio_metadata(path, ent, jpeg)
@@ -374,7 +374,7 @@ def _remove_sidecar_thumbs(media_path: str) -> None:
             pass
 
 
-def _embed_video_covers(info: dict, progress: ProgressCb, cancel: threading.Event) -> None:
+def _embed_video_covers(info: dict, progress: ProgressCb, cancel: threading.Event, client: yt_dlp.YoutubeDL) -> None:
     """Attach square-cropped thumbnail as MP4 cover art (attached_pic) so
     players show it as the poster during playback too."""
     import subprocess
@@ -386,7 +386,7 @@ def _embed_video_covers(info: dict, progress: ProgressCb, cancel: threading.Even
         if not path.lower().endswith(".mp4") or not os.path.exists(path):
             continue
         try:
-            raw = _fetch_thumbnail(ent) or _sidecar_thumbnail(path)
+            raw = _fetch_thumbnail(ent, client) or _sidecar_thumbnail(path)
             jpeg = _square_jpeg(raw) if raw else None
             _remove_sidecar_thumbs(path)
             if not jpeg:
@@ -658,21 +658,37 @@ def run_job(
             progress({"event": "pp", "name": d.get("postprocessor")})
 
     try:
-        info = _try_download(job, progress, [progress_hook], [pp_hook], cancel)
-        if info:
-            title = info.get("title") or info.get("id") or ""
-            if title:
-                progress(
-                    {
-                        "event": "title",
-                        "title": title,
-                        "thumb": _best_thumbnail_url(info),
-                    }
-                )
-        if job.mode == "audio" and info:
-            _tag_audio_files(info, progress, cancel)
-        elif info:
-            _embed_video_covers(info, progress, cancel)
+        with ExitStack() as connections:
+            if cancel.is_set():
+                raise Cancelled()
+            if job.dpi_bypass:
+                progress({"event": "info", "message": "DPI 우회 연결 준비 중…"})
+                proxy = connections.enter_context(bypass_connection(cancel))
+                job = replace(job, proxy=proxy)
+            elif job.auto_proxy and not job.proxy:
+                progress({"event": "info", "message": "실행 중인 프록시 확인 중…"})
+                job = replace(job, proxy=detect_local_proxy())
+            if cancel.is_set():
+                raise Cancelled()
+            info = _try_download(job, progress, [progress_hook], [pp_hook], cancel)
+            if info:
+                # Artwork requests must use the same route as the media download.
+                options = _ydl_opts(job)
+                options["socket_timeout"] = 20
+                with yt_dlp.YoutubeDL(options) as client:
+                    title = info.get("title") or info.get("id") or ""
+                    if title:
+                        progress({
+                            "event": "title",
+                            "title": title,
+                            "thumb_data": _fetch_thumbnail(info, client),
+                        })
+                    if job.mode == "audio":
+                        _tag_audio_files(info, progress, cancel, client)
+                    else:
+                        _embed_video_covers(info, progress, cancel, client)
+            if cancel.is_set():
+                raise Cancelled()
         progress({"event": "done"})
     except Cancelled:
         progress({"event": "cancelled"})

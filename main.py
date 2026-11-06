@@ -2,7 +2,7 @@ import os
 import sys
 
 
-def _selftest(url: str) -> int:
+def _selftest(url: str, dpi_bypass: bool = False) -> int:
     """Headless download verification for CI / packaged builds."""
     import tempfile
     import threading
@@ -10,13 +10,13 @@ def _selftest(url: str) -> int:
     from dawn.downloader import DownloadJob, run_job
 
     outdir = tempfile.mkdtemp(prefix="dawn-selftest-")
-    job = DownloadJob(url=url, mode="audio", quality="192", outdir=outdir)
+    job = DownloadJob(url=url, mode="audio", quality="192", outdir=outdir, dpi_bypass=dpi_bypass)
     last = {}
 
     def cb(d):
         last.update(d)
         if d.get("event") != "progress":
-            print("[selftest]", d)
+            print("[selftest]", {key: value for key, value in d.items() if key != "thumb_data"})
 
     run_job(job, cb, threading.Event())
     ok = last.get("event") == "done"
@@ -28,7 +28,7 @@ def _selftest(url: str) -> int:
 
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--selftest":
-        raise SystemExit(_selftest(sys.argv[2]))
+        raise SystemExit(_selftest(sys.argv[2], dpi_bypass="--dpi-bypass" in sys.argv[3:]))
 
     from dawn.app import main
 

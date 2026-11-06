@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="body" x1="0.25" y1="0" x2="0.7" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#FFE49B"/>
+      <stop offset="1" stop-color="#F4B955"/>
+    </linearGradient>
+    <linearGradient id="wing" x1="0" y1="0" x2="0.8" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#FFDF8B"/>
+      <stop offset="1" stop-color="#EDAA48"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="258" cy="432" rx="131" ry="14" fill="#AA7043" opacity="0.1"/>
+  <path d="M209 398 Q194 417 202 428 Q216 434 234 423 L241 401" fill="#D78342"/>
+  <path d="M281 401 L287 423 Q305 434 319 428 Q327 416 312 398" fill="#D78342"/>
+  <path d="M339 227 C376 209 382 159 404 154 C424 150 433 175 423 204 C416 226 392 255 363 268" fill="url(#wing)" stroke="#EAAF51" stroke-width="3"/>
+  <path d="M228 147 C205 124 205 99 222 87 C241 76 256 103 257 124 C264 101 285 88 297 100 C309 115 289 138 277 149" fill="#F9CA6B" stroke="#EAAF51" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M256 136 C342 136 390 202 392 286 C396 369 345 419 257 419 C167 419 116 371 120 288 C123 204 169 136 256 136Z" fill="url(#body)" stroke="#EAAF51" stroke-width="3"/>
+  <path d="M165 197 C182 173 208 160 234 158" fill="none" stroke="#FFF2C7" stroke-width="9" stroke-linecap="round" opacity="0.85"/>
+  <ellipse cx="260" cy="354" rx="78" ry="46" fill="#FFF0C6" opacity="0.68"/>
+  <path d="M144 274 C121 264 102 275 106 296 C111 321 139 339 165 336 C178 333 178 320 166 311" fill="url(#wing)" stroke="#EAAF51" stroke-width="3" stroke-linecap="round"/>
+  <ellipse cx="182" cy="282" rx="22" ry="12" fill="#E58B62" opacity="0.45"/>
+  <ellipse cx="331" cy="282" rx="22" ry="12" fill="#E58B62" opacity="0.45"/>
+  <ellipse cx="211" cy="257" rx="10" ry="15" fill="#594332"/>
+  <ellipse cx="301" cy="257" rx="10" ry="15" fill="#594332"/>
+  <circle cx="214" cy="252" r="3" fill="#FFF8E8"/>
+  <circle cx="304" cy="252" r="3" fill="#FFF8E8"/>
+  <path d="M241 279 Q256 269 271 279 Q273 287 257 296 Q240 288 241 279Z" fill="#C77438"/>
+  <path d="M246 281 Q256 278 266 281" fill="none" stroke="#F2B467" stroke-width="3" stroke-linecap="round"/>
+  <path d="M413 116 L413 132 M405 124 L421 124" fill="none" stroke="#D7A351" stroke-width="5" stroke-linecap="round"/>
+</svg>
