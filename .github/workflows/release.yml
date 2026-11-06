@@ -36,6 +36,9 @@ jobs:
       - name: Fetch pinned bypass engine and licenses
         run: python scripts/fetch_bypass.py
 
+      - name: Verify format coexistence and thumbnail reuse
+        run: python -m unittest discover -s tests -v
+
       - name: Build
         run: python -m PyInstaller dawn.spec --noconfirm --clean
 

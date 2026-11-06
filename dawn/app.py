@@ -6,6 +6,7 @@ import queue
 import re
 import sys
 import threading
+from dataclasses import replace
 
 from PySide6.QtCore import (
     QRectF,
@@ -87,11 +88,13 @@ STATUS_TEXT = {
     "done": "저장 완료",
     "error": "실패",
     "cancelled": "취소됨",
+    "skipped": "건너뜀",
 }
 STATUS_COLOR = {
     "done": "#28734D",
     "error": "#B63832",
     "cancelled": "#726D66",
+    "skipped": "#726D66",
 }
 
 def _res(name: str) -> str:
@@ -276,6 +279,7 @@ class JobRow(QFrame):
         self.status = "wait"
         self.url = url
         self.outdir = ""
+        self.output_format = "MP4" if mode == "video" else "음원"
 
         self.icon = QLabel("MP4" if mode == "video" else "음원")
         self.icon.setObjectName("mediaBadge")
@@ -330,7 +334,7 @@ class JobRow(QFrame):
 
     def set_state(self, status: str, detail: str = "") -> None:
         self.status = status
-        text = STATUS_TEXT.get(status, status)
+        text = f"{self.output_format} · {STATUS_TEXT.get(status, status)}"
         if detail:
             text = f"{text} — {detail}"
         self.status_lbl.setText(text)
@@ -343,10 +347,11 @@ class JobRow(QFrame):
         elif status == "wait":
             self.bar.setRange(0, 100)
             self.bar.setValue(0)
-        if status in ("done", "error", "cancelled"):
+        if status in ("done", "error", "cancelled", "skipped"):
             self.cancel_btn.hide()
-            self.retry_btn.setVisible(status in ("error", "cancelled"))
-            self.folder_btn.setVisible(status == "done")
+            self.retry_btn.setText("다시 받기" if status == "skipped" else "다시 시도")
+            self.retry_btn.setVisible(status in ("error", "cancelled", "skipped"))
+            self.folder_btn.setVisible(status in ("done", "skipped"))
             self.bar.setRange(0, 100)
             self.bar.setValue(100 if status == "done" else 0)
 
@@ -381,7 +386,7 @@ class JobRow(QFrame):
             bits.append(f"남은 시간 {eta}초")
         self.status = "downloading"
         self.status_lbl.setStyleSheet("")
-        self.status_lbl.setText(f"{STATUS_TEXT['downloading']}  {' · '.join(bits)}".rstrip())
+        self.status_lbl.setText(f"{self.output_format} · {STATUS_TEXT['downloading']}  {' · '.join(bits)}".rstrip())
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +571,7 @@ class MainWindow(QMainWindow):
         self.summary_lbl.setObjectName("appSub")
         self.clear_btn = QPushButton("완료 항목 정리")
         self.clear_btn.setObjectName("ghostBtn")
-        self.clear_btn.setToolTip("완료·취소된 항목만 목록에서 제거합니다. 파일은 삭제하지 않습니다.")
+        self.clear_btn.setToolTip("완료·건너뜀·취소 항목만 목록에서 제거합니다. 파일은 삭제하지 않습니다.")
         self.clear_btn.clicked.connect(self._clear_finished)
         q_row.addWidget(queue_title)
         q_row.addWidget(self.summary_lbl, 1)
@@ -732,7 +737,7 @@ class MainWindow(QMainWindow):
         self.auto_chk.toggled.connect(lambda _: self._auto_timer.stop())
         self.playlist_chk = OptionCheckBox("재생목록 링크는 항상 전체 다운로드")
         self.subs_chk = OptionCheckBox("자막도 저장 (한국어 / 영어 .srt)")
-        self.dedup_chk = OptionCheckBox("이미 받은 항목 건너뛰기")
+        self.dedup_chk = OptionCheckBox("같은 형식으로 이미 받은 항목 건너뛰기")
         self.clip_chk = OptionCheckBox("클립보드 감시 · 링크 복사 시 바로 다운로드")
         for control in (self.auto_chk, self.playlist_chk, self.subs_chk, self.dedup_chk, self.clip_chk):
             download.addWidget(control)
@@ -1064,14 +1069,14 @@ class MainWindow(QMainWindow):
                 added += 1
             else:
                 remaining.append(url)
-        self.url_edit.setText(" ".join(remaining))
+        self.url_edit.setText(" ".join(remaining or (urls if duplicates and not added else [])))
         self._auto_timer.stop()
         if remaining:
             self.feedback_lbl.setText("저장 폴더를 만들 수 없어요. 저장 위치를 변경한 뒤 다시 시작해 주세요.")
         else:
             parts = [f"{added}개를 다운로드 목록에 추가했어요."] if added else []
             if duplicates:
-                parts.append(f"이미 진행 중인 링크 {duplicates}개는 제외했어요.")
+                parts.append(f"같은 링크·형식의 작업 {duplicates}개가 이미 진행 중이에요. 해당 항목으로 이동했어요.")
             self.feedback_lbl.setText(" ".join(parts))
         self._save_settings()
         self.url_edit.setFocus()
@@ -1079,6 +1084,7 @@ class MainWindow(QMainWindow):
     def _enqueue_url(self, url: str, playlist_cache: dict | None = None) -> bool:
         """Queue a URL using the currently selected download options."""
         if self._url_active(url):
+            self.feedback_lbl.setText("같은 링크·형식으로 이미 다운로드 중이에요. 다른 형식은 바로 받을 수 있어요.")
             return False
         outdir = self.folder_edit.text().strip()
         try:
@@ -1189,15 +1195,26 @@ class MainWindow(QMainWindow):
             cache[url] = result
         return result
 
-    def _url_active(self, url: str) -> bool:
-        for _item, row in self._rows.values():
-            if row.url == url and row.status in ("wait", "extract", "downloading", "postprocess"):
+    def _url_active(self, url: str, job: DownloadJob | None = None) -> bool:
+        mode = job.mode if job else self._mode
+        codec = job.audio_codec if job else self._job_quality()[1]
+        outdir = os.path.normcase(os.path.realpath(job.outdir if job else self.folder_edit.text().strip()))
+        for item, row in self._rows.values():
+            if (
+                row.url == url
+                and row.status in ("wait", "extract", "downloading", "postprocess")
+                and row.job.mode == mode
+                and (mode == "video" or row.job.audio_codec == codec)
+                and os.path.normcase(os.path.realpath(row.job.outdir)) == outdir
+            ):
+                self.list.setCurrentItem(item)
+                self.list.scrollToItem(item)
                 return True
         return False
 
     def _clear_finished(self) -> None:
         for job_id, (item, row) in list(self._rows.items()):
-            if row.status in ("done", "cancelled"):
+            if row.status in ("done", "cancelled", "skipped"):
                 self.list.takeItem(self.list.row(item))
                 del self._rows[job_id]
         self._update_summary()
@@ -1219,10 +1236,13 @@ class MainWindow(QMainWindow):
             n_cancelled = sum(1 for _i, r in self._rows.values() if r.status == "cancelled")
             if n_cancelled:
                 bits.append(f"취소 {n_cancelled}")
+            n_skipped = sum(1 for _i, r in self._rows.values() if r.status == "skipped")
+            if n_skipped:
+                bits.append(f"건너뜀 {n_skipped}")
             self.summary_lbl.setText(" · ".join(bits))
         self.summary_lbl.setToolTip(self.summary_lbl._full)
         self.stack.setCurrentIndex(0 if not self._rows else 1)
-        self.clear_btn.setEnabled(any(r.status in ("done", "cancelled") for _i, r in self._rows.values()))
+        self.clear_btn.setEnabled(any(r.status in ("done", "cancelled", "skipped") for _i, r in self._rows.values()))
 
     def _add_row(self, job: DownloadJob) -> None:
         job_id = self._next_id
@@ -1230,6 +1250,9 @@ class MainWindow(QMainWindow):
         row = JobRow(job.url, job.mode)
         row.outdir = job.outdir
         row.job = job
+        row.output_format = job.output_format.upper()
+        row.icon.setText(row.output_format)
+        row.set_state("wait")
         item = QListWidgetItem()
         self.list.addItem(item)
         self.list.setItemWidget(item, row)
@@ -1247,6 +1270,11 @@ class MainWindow(QMainWindow):
         if not pair:
             return
         _item, row = pair
+        if self._url_active(row.job.url, row.job):
+            self.feedback_lbl.setText("같은 링크·형식의 작업이 이미 진행 중이에요.")
+            return
+        if row.status == "skipped":
+            row.job = replace(row.job, dedup=False)
         row.reset_for_retry()
         self.worker.add(job_id, row.job)
         self._update_summary()
@@ -1305,6 +1333,9 @@ class MainWindow(QMainWindow):
         elif ev == "done":
             row.set_state("done")
             self._notify_done(row.title.text())
+            self._update_summary()
+        elif ev == "skipped":
+            row.set_state("skipped", d.get("message") or "")
             self._update_summary()
         elif ev == "cancelled":
             row.set_state("cancelled")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from tempfile import TemporaryDirectory
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
@@ -81,6 +82,10 @@ class DownloadJob:
     dpi_bypass: bool = False          # managed platform-specific DPI engine
     auto_proxy: bool = False          # discover an existing HTTP proxy in worker
 
+    @property
+    def output_format(self) -> str:
+        return self.audio_codec if self.mode == "audio" else "mp4"
+
 
 def _format_selector(quality: str) -> str:
     if quality == "1080":
@@ -101,6 +106,26 @@ class _NullLogger:
 
     def error(self, msg):
         pass
+
+
+class _DownloadYDL(yt_dlp.YoutubeDL):
+    """Track archive skips without parsing logs; protect other output formats."""
+
+    archive_skipped = False
+
+    def in_download_archive(self, info_dict):
+        recorded = super().in_download_archive(info_dict)
+        if recorded:
+            self.archive_skipped = True
+        return recorded
+
+    def existing_file(self, filepaths, *, default_overwrite=True):
+        final_ext = self.params.get("final_ext")
+        if not default_overwrite and final_ext in ("mp3", "m4a", "flac"):
+            # A saved MP4 belongs to the video job, not this audio conversion.
+            # Only reuse/overwrite the requested final audio format.
+            filepaths = (path for path in filepaths if path.endswith(f".{final_ext}"))
+        return super().existing_file(filepaths, default_overwrite=default_overwrite)
 
 
 def _js_runtimes() -> dict:
@@ -172,10 +197,11 @@ def detect_local_proxy(timeout: float = 0.4) -> Optional[str]:
 def _ydl_opts(job: DownloadJob) -> dict:
     opts = {
         "outtmpl": os.path.join(
-            job.outdir,
-            "%(playlist_title|)s",
+            "%(playlist_title|.)s",
             "%(playlist_index&{:>03} - |)s%(title).150B.%(ext)s",
         ),
+        "paths": {"home": os.path.abspath(job.outdir)},
+        "overwrites": not job.dedup,
         "ffmpeg_location": _FFMPEG_EXE,
         "noplaylist": not job.playlist,
         "ignoreerrors": job.playlist,  # dead/private entries shouldn't kill a playlist batch
@@ -192,6 +218,7 @@ def _ydl_opts(job: DownloadJob) -> dict:
     opts.update(job.cookies.ydl_opts())
     if job.mode == "audio":
         opts["format"] = "ba/b"
+        opts["final_ext"] = job.audio_codec
         opts["writethumbnail"] = True  # yt-dlp fetches w/ its cookies+proxy → more reliable than raw urllib
         pp = {"key": "FFmpegExtractAudio", "preferredcodec": job.audio_codec}
         if job.audio_codec != "flac":  # lossless: bitrate flag is meaningless
@@ -219,7 +246,9 @@ def _ydl_opts(job: DownloadJob) -> dict:
             + [{"key": "FFmpegSubtitlesConvertor", "format": "srt"}],
         )
     if job.dedup:
-        opts["download_archive"] = os.path.join(job.outdir, ".dawn-archive.txt")
+        opts["download_archive"] = os.path.join(
+            job.outdir, f".dawn-archive-{job.mode}-{job.output_format}.txt"
+        )
     return opts
 
 
@@ -247,15 +276,21 @@ def _best_thumbnail_url(info: dict, client: yt_dlp.YoutubeDL) -> Optional[str]:
 
 
 def _fetch_thumbnail(info: dict, client: yt_dlp.YoutubeDL) -> Optional[bytes]:
-    url = _best_thumbnail_url(info, client)
-    if not url:
-        return None
-    try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with client.urlopen(req) as r:
-            return r.read()
-    except Exception:
-        return None
+    if "__dawn_thumbnail" in info:
+        return info["__dawn_thumbnail"]
+    raw = next((data for _, path in _final_files(info)
+                if (data := _sidecar_thumbnail(path))), None)
+    if raw is None:
+        url = _best_thumbnail_url(info, client)
+        if url:
+            try:
+                req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with client.urlopen(req) as response:
+                    raw = response.read()
+            except Exception:
+                pass
+    info["__dawn_thumbnail"] = raw
+    return raw
 
 _PLAYER_CLIENTS = [["default"], ["android"], ["ios"], ["tv"]]
 
@@ -272,7 +307,8 @@ def _try_download(
     progress_hooks: list,
     pp_hooks: list,
     cancel: threading.Event,
-) -> Optional[dict]:
+    tempdir: str,
+) -> tuple[Optional[dict], bool]:
     """Download, retrying with alternate YouTube player clients when the
     current IP is bot-gated on the default (web) client."""
     last_exc: Optional[Exception] = None
@@ -280,14 +316,16 @@ def _try_download(
         if cancel.is_set():
             raise Cancelled()
         opts = _ydl_opts(job)
+        opts["paths"]["temp"] = tempdir
         opts["progress_hooks"] = progress_hooks
         opts["postprocessor_hooks"] = pp_hooks
         if clients != ["default"]:
             opts["extractor_args"] = {"youtube": {"player_client": clients}}
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with _DownloadYDL(opts) as ydl:
                 progress({"event": "info", "phase": "extract"})
-                return ydl.extract_info(job.url, download=True)
+                info = ydl.extract_info(job.url, download=True)
+                return info, ydl.archive_skipped
         except Cancelled:
             raise
         except Exception as e:  # noqa: BLE001
@@ -627,7 +665,7 @@ def run_job(
     cancel: threading.Event,
 ) -> None:
     """Run one job to completion. Calls progress(dict) with keys:
-    event: 'info'|'progress'|'pp'|'done'|'error'|'cancelled'
+    event: 'info'|'progress'|'pp'|'done'|'skipped'|'error'|'cancelled'
     """
 
     def progress_hook(d: dict) -> None:
@@ -670,7 +708,19 @@ def run_job(
                 job = replace(job, proxy=detect_local_proxy())
             if cancel.is_set():
                 raise Cancelled()
-            info = _try_download(job, progress, [progress_hook], [pp_hook], cancel)
+            tempdir = connections.enter_context(
+                TemporaryDirectory(prefix=".dawn-", dir=os.path.abspath(job.outdir))
+            )
+            info, archive_skipped = _try_download(
+                job, progress, [progress_hook], [pp_hook], cancel, tempdir
+            )
+            if archive_skipped and not any(_final_files(info)):
+                if cancel.is_set():
+                    raise Cancelled()
+                progress({"event": "skipped", "message": f"이미 저장한 {job.output_format.upper()} 형식이에요. 필요하면 다시 받을 수 있어요."})
+                return
+            if not info:
+                raise RuntimeError("다운로드할 항목을 가져오지 못했어요.")
             if info:
                 # Artwork requests must use the same route as the media download.
                 options = _ydl_opts(job)
